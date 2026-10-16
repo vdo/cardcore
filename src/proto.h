@@ -8,7 +8,7 @@
 #include <string.h>
 #include "monocypher.h"
 
-enum : uint8_t { T_BEACON = 1, T_MSG = 2, T_ACK = 3 };
+enum : uint8_t { T_BEACON = 1, T_MSG = 2, T_ACK = 3, T_VOICE = 4 };
 constexpr uint32_t BCAST = 0xFFFFFFFF;
 constexpr size_t MAXPKT = 255, OUTER = 1 + 24 + 16, HDR = 9, E2E = 16;
 constexpr size_t MAXTEXT = MAXPKT - OUTER - HDR - E2E - 4;  // 4 = msgId

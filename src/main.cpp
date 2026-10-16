@@ -5,6 +5,9 @@
 #include <Preferences.h>
 #include <TinyGPSPlus.h>
 #include <bootloader_random.h>
+#include <SD.h>
+#include <codec2.h>
+#include <algorithm>
 #include <vector>
 #include "proto.h"
 
@@ -30,10 +33,17 @@
 #define GPS_RX 15
 #define GPS_TX 13
 #define GPS_BAUD 115200
+#define P_SD_CS 12  // SD shares the LoRa SPI bus
+#define VOLUME 200  // speaker 0-255
 
 constexpr uint8_t TTL = 3;
 constexpr uint32_t BEACON_MS = 5 * 60 * 1000, ACK_MS = 15000, SCREEN_MS = 30000;
 constexpr int TRIES = 3, ROWS = 11, COLS = 38, MAXCONTACTS = 32;
+// Codec2 1300 bps: 40 ms frames of 320 samples @ 8 kHz -> 7 bytes. 25 frames (1 s) per packet.
+constexpr int SPF = 320, VBYTES = 7, VFRAMES = 25, VMAX_S = 20;
+constexpr size_t VCHUNK = VFRAMES * VBYTES;
+
+SET_LOOP_TASK_STACK_SIZE(32 * 1024);  // codec2 needs far more than the default 8 KB
 
 struct Contact {
   char name[17];
@@ -51,6 +61,14 @@ struct Out {
   String text;
   int tries;
   uint32_t at;
+  std::vector<uint8_t> voice;  // empty = text message
+  uint32_t need;               // chunks not yet acked (text: 1)
+};
+struct RxVoice {
+  uint32_t peer, msgId, got;
+  uint8_t total;
+  size_t len;
+  std::vector<uint8_t> data;
 };
 struct Tx {
   uint8_t b[MAXPKT];
@@ -60,24 +78,27 @@ struct Tx {
 
 SX1262 radio = new Module(P_NSS, P_IRQ, P_RST, P_BUSY);
 TinyGPSPlus gps;
+CODEC2 *c2;
 Preferences prefs;
 M5Canvas cv(&M5Cardputer.Display);
 
 uint8_t sec[32], pub[32], netKey[32], bootSeed[16];
 uint64_t ctr;
 uint32_t me, nextBeacon, lastDraw, lastActive;
-String myName, netPass, input;
+String myName, netPass, input, status;
 std::vector<Contact> contacts, pending;
 std::vector<uint32_t> ignored, seen;
 std::vector<Line> lines;
 std::vector<Out> outbox;
+std::vector<RxVoice> rxv;
 std::vector<Tx> txq;
 size_t cur;
 int lastRssi;
 volatile bool rxFlag;
-bool dirty = true, asleep;
+bool dirty = true, asleep, sd;
 
 void IRAM_ATTR onRx() { rxFlag = true; }
+void draw();
 
 void wake() {
   lastActive = millis();
@@ -134,7 +155,7 @@ void makeNonce(uint8_t n[24]) {
 }
 
 void queue(const uint8_t *b, size_t n, uint32_t delay) {
-  if (txq.size() >= 8) return;  // ponytail: drop when flooded; no duty-cycle accounting, fine for chat volumes
+  if (txq.size() >= 32) return;  // ponytail: drop when flooded; no duty-cycle accounting, fine for chat volumes
   Tx t;
   memcpy(t.b, b, n);
   t.n = n;
@@ -166,12 +187,26 @@ void sendMsg(Out &o) {
     o.tries = TRIES;
     return;
   }
-  uint8_t b[4 + MAXTEXT];
-  put32(b, o.msgId);
-  memcpy(b + 4, o.text.c_str(), o.text.length());
-  send(T_MSG, o.peer, b, 4 + o.text.length(), c->key);
+  if (o.voice.empty()) {
+    uint8_t b[4 + MAXTEXT];
+    put32(b, o.msgId);
+    memcpy(b + 4, o.text.c_str(), o.text.length());
+    send(T_MSG, o.peer, b, 4 + o.text.length(), c->key);
+  } else {  // resend only the chunks not acked yet; the last one asks the receiver for an ack
+    size_t total = (o.voice.size() + VCHUNK - 1) / VCHUNK, last = 31 - __builtin_clz(o.need);
+    for (size_t i = 0; i < total; i++) {
+      if (!(o.need >> i & 1)) continue;
+      uint8_t b[6 + VCHUNK];
+      size_t n = std::min(VCHUNK, o.voice.size() - i * VCHUNK);
+      put32(b, o.msgId);
+      b[4] = i | (i == last ? 0x80 : 0);
+      b[5] = total;
+      memcpy(b + 6, o.voice.data() + i * VCHUNK, n);
+      send(T_VOICE, o.peer, b, 6 + n, c->key);
+    }
+  }
   o.tries++;
-  o.at = millis() + ACK_MS;
+  o.at = millis() + ACK_MS + (o.voice.empty() ? 0 : __builtin_popcount(o.need) * 2600);  // + airtime
 }
 
 void setState(uint32_t peer, uint32_t msgId, char state) {
@@ -182,9 +217,187 @@ void setState(uint32_t peer, uint32_t msgId, char state) {
 
 void sendText(const String &s) {
   if (contacts.empty()) return sys("no contacts yet");
-  Out o{esp_random(), contacts[cur].id, s.substring(0, MAXTEXT), 0, millis()};
+  Out o{esp_random(), contacts[cur].id, s.substring(0, MAXTEXT), 0, millis(), {}, 1};
   addLine(o.peer, o.msgId, '?', o.text);
   outbox.push_back(o);
+}
+
+// ---- voice ----
+String voiceLabel(size_t bytes, uint32_t num) {
+  char s[32];
+  double secs = bytes / VBYTES * 0.04;
+  if (num) snprintf(s, sizeof s, "voice %.1fs #%lu", secs, (unsigned long)num);
+  else snprintf(s, sizeof s, "voice %.1fs (no SD)", secs);
+  return s;
+}
+
+// Standard Codec2 .c2 file: plays on a PC with `c2dec 1300 x.c2 x.raw`
+uint32_t saveVoice(uint32_t peer, char dir, const std::vector<uint8_t> &d) {
+  if (!sd) return 0;
+  uint32_t num = prefs.getUInt("vnum", 0) + 1;
+  prefs.putUInt("vnum", num);
+  char path[40];
+  snprintf(path, sizeof path, "/cardxat/%04lu_%08lx_%c.c2", (unsigned long)num, (unsigned long)peer, dir);
+  File f = SD.open(path, FILE_WRITE);
+  if (!f) return 0;
+  const uint8_t hdr[7] = {0xc0, 0xde, 0xc2, 0, 9, CODEC2_MODE_1300, 0};
+  f.write(hdr, sizeof hdr);
+  f.write(d.data(), d.size());
+  f.close();
+  return num;
+}
+
+// num 0 = newest one with this peer
+String findVoice(uint32_t peer, uint32_t num, bool list = false) {
+  String best;
+  uint32_t bestNum = 0;
+  std::vector<String> all;
+  File d = SD.open("/cardxat");
+  for (File f = d.openNextFile(); f; f = d.openNextFile()) {
+    unsigned long n, p;
+    if (sscanf(f.name(), "%lu_%lx", &n, &p) != 2) continue;
+    if (list && p == peer) all.push_back(f.name());
+    if (num ? n == num : p == peer && n > bestNum) {
+      bestNum = n;
+      best = String("/cardxat/") + f.name();
+    }
+  }
+  std::sort(all.begin(), all.end());  // zero-padded, so text order = time order
+  for (size_t i = all.size() > 8 ? all.size() - 8 : 0; i < all.size(); i++) sys(all[i]);
+  return best;
+}
+
+bool pumpTx() {  // sends the first due packet
+  for (size_t i = 0; i < txq.size(); i++) {
+    if ((int32_t)(millis() - txq[i].at) < 0) continue;
+    int st = radio.transmit(txq[i].b, txq[i].n);
+    if (st != RADIOLIB_ERR_NONE) sys("tx err " + String(st));
+    txq.erase(txq.begin() + i);
+    rxFlag = false;  // DIO1 also fires on tx done
+    radio.startReceive();
+    return true;
+  }
+  return false;
+}
+
+// Blocking, like a walkie: the radio keeps only the last packet that arrives meanwhile
+void playVoice(const uint8_t *d, size_t n) {
+  static int16_t pcm[3][SPF];  // speaker holds 2 queued, we fill the 3rd
+  if (!c2) return;
+  while (pumpTx()) {}  // get our ack out first
+  wake();
+  status = "PLAY  tap G0 to stop";
+  draw();
+  setCpuFrequencyMhz(240);
+  for (size_t i = 0, k = 0; i + VBYTES <= n; i += VBYTES, k++) {
+    codec2_decode(c2, pcm[k % 3], d + i);
+    while (M5Cardputer.Speaker.isPlaying(0) >= 2) delay(1);
+    M5Cardputer.Speaker.playRaw(pcm[k % 3], SPF, 8000, false, 1, 0);
+    M5.update();
+    if (M5Cardputer.BtnA.wasPressed()) {
+      M5Cardputer.Speaker.stop(0);
+      break;
+    }
+  }
+  while (M5Cardputer.Speaker.isPlaying()) delay(1);
+  setCpuFrequencyMhz(80);
+  status = "";
+  dirty = true;
+}
+
+void playFile(const String &path) {
+  File f = SD.open(path.c_str());
+  if (!f || f.size() < 7 || f.size() > 8192) return sys("no such voice message");
+  std::vector<uint8_t> d(f.size());
+  f.read(d.data(), d.size());
+  f.close();
+  playVoice(d.data() + 7, d.size() - 7);  // skip .c2 header
+}
+
+void playLatest() {
+  String path = sd && !contacts.empty() ? findVoice(contacts[cur].id, 0) : String();
+  if (path.isEmpty()) return sys("no saved voice messages here");
+  playFile(path);
+}
+
+// Hold G0 to talk: encodes while recording, frame by frame
+void talk() {
+  static int16_t pcm[3][SPF];  // mic holds 2 queued, we encode the 3rd
+  if (!c2) return sys("codec2 init failed");
+  std::vector<uint8_t> enc;
+  auto encode = [&](int16_t *p) {
+    uint8_t b[VBYTES];
+    codec2_encode(c2, b, p);
+    enc.insert(enc.end(), b, b + VBYTES);
+  };
+  wake();
+  setCpuFrequencyMhz(240);
+  M5Cardputer.Speaker.end();  // mic and speaker share the I2S pins
+  M5Cardputer.Mic.begin();
+  int k = 0;
+  for (; M5Cardputer.BtnA.isPressed() && k < VMAX_S * VFRAMES; k++) {
+    M5Cardputer.Mic.record(pcm[k % 3], SPF, 8000);  // waits for a free slot, so k-2 is done
+    if (k >= 2) encode(pcm[(k - 2) % 3]);
+    if (k % VFRAMES == 0) {
+      status = "REC " + String(k / VFRAMES) + "/" + String(VMAX_S) + "s";
+      draw();
+    }
+    M5.update();
+  }
+  while (M5Cardputer.Mic.isRecording()) delay(1);
+  for (int j = std::max(0, k - 2); j < k; j++) encode(pcm[j % 3]);
+  M5Cardputer.Mic.end();
+  M5Cardputer.Speaker.begin();
+  setCpuFrequencyMhz(80);
+  status = "";
+  dirty = true;
+
+  if (k < 12) return playLatest();  // under 0.5 s = a tap: replay instead
+  if (contacts.empty()) return sys("no contacts yet");
+  uint32_t chunks = (enc.size() + VCHUNK - 1) / VCHUNK;
+  Out o{esp_random(), contacts[cur].id, "", 0, millis(), enc, (1u << chunks) - 1};
+  o.text = voiceLabel(enc.size(), saveVoice(o.peer, 'o', enc));
+  addLine(o.peer, o.msgId, '?', o.text);
+  outbox.push_back(o);
+}
+
+void ackVoice(const Contact &c, uint32_t msgId, uint32_t got) {
+  uint8_t a[8];
+  put32(a, msgId);
+  put32(a + 4, got);
+  send(T_ACK, c.id, a, 8, c.key);  // no delay: must leave before we start playing
+}
+
+void onVoice(Inner &in, const Contact &c, uint32_t msgId) {
+  uint8_t seq = in.body()[4] & 0x7f, total = in.body()[5];
+  bool last = in.body()[4] & 0x80;
+  size_t n = in.len() - 6;
+  if (!total || total > VMAX_S || seq >= total || !n || n > VCHUNK || n % VBYTES) return;
+  uint32_t full = (1u << total) - 1;
+  for (auto &l : lines)
+    if (l.peer == c.id && l.msgId == msgId && l.state == '<') return last ? ackVoice(c, msgId, full) : void();
+  RxVoice *v = nullptr;
+  for (auto &r : rxv)
+    if (r.peer == c.id && r.msgId == msgId) v = &r;
+  if (!v) {
+    if (rxv.size() >= 4) rxv.erase(rxv.begin());
+    rxv.push_back({c.id, msgId, 0, total, 0, std::vector<uint8_t>(total * VCHUNK)});
+    v = &rxv.back();
+  }
+  if (total != v->total) return;
+  memcpy(v->data.data() + seq * VCHUNK, in.body() + 6, n);
+  if (seq == total - 1) v->len = seq * VCHUNK + n;
+  v->got |= 1u << seq;
+  if (v->got != full) {
+    if (last) ackVoice(c, msgId, v->got);  // tells the sender what's missing
+    return;
+  }
+  std::vector<uint8_t> d(v->data.begin(), v->data.begin() + v->len);
+  rxv.erase(rxv.begin() + (v - rxv.data()));
+  ackVoice(c, msgId, full);
+  addLine(c.id, msgId, '<', voiceLabel(d.size(), saveVoice(c.id, 'i', d)));
+  if (contacts[cur].id != c.id) sys(String("voice from ") + c.name + " (Tab)");
+  playVoice(d.data(), d.size());
 }
 
 void onBeacon(Inner &in, Contact *c) {
@@ -246,13 +459,21 @@ void handleRx() {
     addLine(src, msgId, '<', clean(in.body() + 4, in.len() - 4));
     if (contacts[cur].id != src) sys(String("msg from ") + c->name + " (Tab)");
     M5Cardputer.Speaker.tone(3000, 60);
+  } else if (in.type() == T_VOICE && in.len() > 6) {
+    onVoice(in, *c, msgId);
   } else if (in.type() == T_ACK) {
-    for (size_t i = 0; i < outbox.size(); i++)
-      if (outbox[i].msgId == msgId && outbox[i].peer == src) {
+    uint32_t got = in.len() >= 8 ? get32(in.body() + 4) : ~0u;  // voice acks list the chunks received
+    for (size_t i = 0; i < outbox.size(); i++) {
+      Out &o = outbox[i];
+      if (o.msgId != msgId || o.peer != src) continue;
+      o.need &= ~got;
+      if (o.need) o.at = millis();  // resend the missing chunks now
+      else {
         outbox.erase(outbox.begin() + i);
-        break;
+        setState(src, msgId, '+');
       }
-    setState(src, msgId, '+');
+      break;
+    }
   }
 }
 
@@ -300,11 +521,16 @@ void command(String s) {
   } else if (cmd == "/b") {
     beacon();
     sys("beacon sent");
+  } else if (cmd == "/play") {
+    if (arg.isEmpty()) playLatest();
+    else playFile(sd ? findVoice(0, arg.toInt()) : String());
+  } else if (cmd == "/voices") {
+    if (sd && !contacts.empty()) findVoice(contacts[cur].id, 0, true);
   } else if (cmd == "/fp") {
     sys("me " + fpStr(pub));
     if (!contacts.empty()) sys(String(contacts[cur].name) + " " + fpStr(contacts[cur].pub));
   } else {
-    sys("/name /net /ok /no /del /loc /b(eacon) /fp  Tab=next");
+    sys("/name /net /ok /no /del /loc /b(eacon) /fp /play [n] /voices  Tab=next  hold G0=talk, tap=replay");
   }
 }
 
@@ -319,7 +545,7 @@ void enter(String s) {
 
 void draw() {
   cv.fillSprite(BLACK);
-  cv.fillRect(0, 0, 240, 10, NAVY);
+  cv.fillRect(0, 0, 240, 10, status.length() ? RED : NAVY);
   cv.setTextColor(WHITE);
   cv.setCursor(2, 1);
   if (contacts.empty()) cv.print("no contacts");
@@ -332,7 +558,10 @@ void draw() {
     }
   }
   cv.setCursor(150, 1);
-  cv.printf("%s%4d s%lu", pending.empty() ? "   " : "REQ", lastRssi, (unsigned long)gps.satellites.value());
+  if (status.length()) {
+    cv.setCursor(2, 1);
+    cv.print(status);
+  } else cv.printf("%s%4d s%lu", pending.empty() ? "   " : "REQ", lastRssi, (unsigned long)gps.satellites.value());
 
   // newest rows first, then drawn bottom-up
   struct Row {
@@ -401,6 +630,8 @@ void setup() {
     ioe.digitalWrite(0, true);
   } else sys("no Cap IO expander (0x43)");
 
+  pinMode(P_SD_CS, OUTPUT);  // keep the SD card off the bus while the radio starts
+  digitalWrite(P_SD_CS, HIGH);
   SPI.begin(P_SCK, P_MISO, P_MOSI, P_NSS);
   int st = radio.begin(FREQ, BW, SF, CR, SYNC, TXPWR, 8, TCXO_V, true);
   if (st != RADIOLIB_ERR_NONE) sys("radio init failed " + String(st));
@@ -409,6 +640,12 @@ void setup() {
   radio.startReceive();
 
   Serial1.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
+
+  sd = SD.begin(P_SD_CS, SPI, 20000000);
+  if (sd) SD.mkdir("/cardxat");
+  else sys("no SD card: voice messages won't be saved");
+  c2 = codec2_create(CODEC2_MODE_1300);
+  M5Cardputer.Speaker.setVolume(VOLUME);
 
   sys("me " + fpStr(pub));
   if (myName.isEmpty()) sys("type your name + Enter");
@@ -443,15 +680,9 @@ void loop() {
     i++;
   }
 
-  for (size_t i = 0; i < txq.size(); i++) {  // one packet per loop
-    if ((int32_t)(millis() - txq[i].at) < 0) continue;
-    int st = radio.transmit(txq[i].b, txq[i].n);
-    if (st != RADIOLIB_ERR_NONE) sys("tx err " + String(st));
-    txq.erase(txq.begin() + i);
-    rxFlag = false;  // DIO1 also fires on tx done
-    radio.startReceive();
-    break;
-  }
+  pumpTx();  // one packet per loop
+
+  if (M5Cardputer.BtnA.wasPressed()) talk();
 
   if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
     bool wasAsleep = asleep;

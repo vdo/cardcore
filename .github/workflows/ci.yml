@@ -13,7 +13,7 @@ jobs:
   lint:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: pip install clang-format==18.1.8
       - run: clang-format --dry-run --Werror src/*.cpp src/*.h test/*.cpp sim/*.cpp
       - run: sudo apt-get update && sudo apt-get install -y cppcheck
@@ -26,18 +26,18 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: cc -O2 -c lib/monocypher/monocypher.c -o m.o
       - run: c++ -std=c++17 -Wall -Werror -Isrc -Ilib/monocypher test/test_proto.cpp m.o -o t && ./t
 
   build:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: ~/.platformio
           key: pio-${{ hashFiles('platformio.ini') }}
@@ -52,7 +52,7 @@ jobs:
             0x10000 $B/firmware.bin
       - name: screenshot simulator still builds and runs
         run: sudo apt-get update && sudo apt-get install -y libsdl2-dev && sh sim/run.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: firmware
           path: cardxat-*.bin
@@ -64,7 +64,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: firmware
       - run: gh release create "$GITHUB_REF_NAME" cardxat-*.bin --repo "$GITHUB_REPOSITORY" --generate-notes

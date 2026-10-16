@@ -22,6 +22,12 @@ void bootloader_random_enable() {}
 void bootloader_random_disable() {}
 #define IRAM_ATTR
 #define SERIAL_8N1 0
+#define OUTPUT 1
+#define HIGH 1
+#define FILE_WRITE "w"
+#define SET_LOOP_TASK_STACK_SIZE(n)
+void pinMode(int, int) {}
+void digitalWrite(int, int) {}
 
 struct String : std::string {
   String() {}
@@ -38,6 +44,7 @@ struct String : std::string {
   String substring(size_t a, size_t b = npos) const { return a >= size() ? String() : String(substr(a, b - a)); }
   void remove(size_t i) { erase(i); }
   int indexOf(char c) const { return find(c) == npos ? -1 : (int)find(c); }
+  long toInt() const { return atol(c_str()); }
   void trim() {
     erase(0, find_first_not_of(' '));
     erase(find_last_not_of(' ') + 1);
@@ -56,6 +63,7 @@ struct {
 // ---- M5Cardputer / M5Unified ----
 struct {
   int config() { return 0; }
+  void update() {}
 } M5;
 struct SimDisplay : M5Canvas {
   void setRotation(int) {}  // sprite is already landscape
@@ -77,7 +85,23 @@ struct {
   } Keyboard;
   struct {
     void tone(int, int) {}
+    void setVolume(int) {}
+    void begin() {}
+    void end() {}
+    void stop(int) {}
+    int isPlaying(int = 0) { return 0; }
+    void playRaw(const int16_t *, size_t, int, bool, int, int) {}
   } Speaker;
+  struct {
+    void begin() {}
+    void end() {}
+    int isRecording() { return 0; }
+    void record(int16_t *, size_t, int) {}
+  } Mic;
+  struct {
+    bool isPressed() { return false; }
+    bool wasPressed() { return false; }
+  } BtnA;
   void begin(int, bool) { Display.createSprite(240, 135); }
   void update() {}
 } M5Cardputer;
@@ -119,6 +143,28 @@ struct SX1262 {
   float getRSSI() { return -97; }
 };
 
+// ---- codec2 + SD: frames are opaque bytes here ----
+#define CODEC2_MODE_1300 4
+struct CODEC2 {};
+CODEC2 *codec2_create(int) { return new CODEC2; }
+void codec2_encode(CODEC2 *, unsigned char *b, short *) { memset(b, 0, 7); }
+void codec2_decode(CODEC2 *, short *pcm, const unsigned char *) { memset(pcm, 0, 640); }
+struct File {
+  bool ok;
+  operator bool() const { return ok; }
+  size_t write(const uint8_t *, size_t n) { return n; }
+  size_t size() { return 0; }
+  size_t read(uint8_t *, size_t) { return 0; }
+  void close() {}
+  const char *name() { return ""; }
+  File openNextFile() { return {false}; }
+};
+struct {
+  bool begin(int, decltype(SPI) &, int) { return true; }
+  void mkdir(const char *) {}
+  File open(const char *, const char * = "r") { return {true}; }
+} SD;
+
 struct TinyGPSPlus {
   struct {
     bool isValid() { return true; }
@@ -145,6 +191,8 @@ struct Preferences {
   void putBytes(const char *k, const void *b, size_t n) { m[k].assign((const char *)b, n); }
   String getString(const char *k, const char *d) { return m.count(k) ? String(m[k]) : String(d); }
   void putString(const char *k, const String &v) { m[k] = v; }
+  uint32_t getUInt(const char *k, uint32_t d) { return m.count(k) ? atol(m[k].c_str()) : d; }
+  void putUInt(const char *k, uint32_t v) { m[k] = std::to_string(v); }
 };
 
 #include "../src/main.cpp"
@@ -180,6 +228,31 @@ void aliceSays(const char *text) {
   put32(b, esp_random());
   memcpy(b + 4, text, strlen(text));
   fromAlice(T_MSG, me, b, 4 + strlen(text), aKey);
+}
+void aliceVoiceChunk(uint32_t id, uint32_t i, uint32_t total, size_t n, bool last) {
+  uint8_t b[6 + VCHUNK] = {};
+  put32(b, id);
+  b[4] = i | (last ? 0x80 : 0);
+  b[5] = total;
+  fromAlice(T_VOICE, me, b, 6 + n, aKey);
+}
+// Sends a voice message the way the real sender cuts it, losing chunk `drop` on the first round.
+// Doubles as the check for selective resend: bob must ack exactly what he got.
+int aliceVoice(float secs, uint32_t drop) {
+  uint32_t id = esp_random(), bytes = secs / 0.04 * VBYTES, total = (bytes + VCHUNK - 1) / VCHUNK;
+  auto len = [&](uint32_t i) { return std::min<size_t>(VCHUNK, bytes - i * VCHUNK); };
+  radio.tx.clear();
+  for (uint32_t i = 0; i < total; i++)
+    if (i != drop) aliceVoiceChunk(id, i, total, len(i), i == total - 1);
+  uint32_t got = 0;
+  for (auto &p : radio.tx) {
+    Inner in;
+    if (openNet(in, p.data(), p.size(), aNet) && in.type() == T_ACK && openE2E(in, aKey) && in.len() == 8)
+      got = get32(in.body() + 4);
+  }
+  if (got != ((1u << total) - 1 & ~(1u << drop))) return printf("FAIL: bob acked %x\n", got), 1;
+  aliceVoiceChunk(id, drop, total, len(drop), true);
+  return lines.back().text.find("voice") == 0 ? 0 : (printf("FAIL: voice not completed\n"), 1);
 }
 void aliceAcks(size_t skipLast) {  // ACK what bob sent to alice, except the last `skipLast` messages
   std::vector<uint32_t> ids;
@@ -235,6 +308,7 @@ int main(int argc, char **argv) {
   type("yes, 3 of us. need water, no injuries");
   aliceAcks(0);
   aliceSays("ok. road north is blocked, use the river path");
+  if (aliceVoice(4.4, 1)) return 1;
   type("/loc");
   aliceAcks(0);
   type("leaving in 10 min");

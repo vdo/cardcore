@@ -60,6 +60,9 @@ What you give up: no interop with Meshtastic or MeshCore devices, no smart routi
 | `/loc` | send your GPS position to the current contact |
 | `/fp` | show your fingerprint and the contact's |
 | `/b` | send a beacon now (normally every ~5 min) |
+| hold **G0** | record a voice message (release to send, max 20 s) |
+| tap **G0** | replay the latest voice message in this chat; tap again to stop |
+| `/voices` `/play n` | list saved voice messages in this chat, play #n |
 | `/del` | delete current contact |
 | `/name x` `/net x` | change name / network |
 
@@ -67,6 +70,23 @@ Message colours: white = sending, green = delivered (ACKed), red = failed after 
 Header: contact, last heard, `REQ` if a request is waiting, RSSI of the last packet, GPS satellites.
 
 The screen sleeps after 30 s. The first key press only wakes it, and incoming messages or requests wake it too.
+
+## Voice messages
+Hold the **G0** side button and talk. When you let go, the message goes to the current contact.
+Incoming voice messages **play automatically**, like a walkie-talkie, and are **saved to the SD card**,
+so you can replay them later, even after a reboot.
+
+- **Codec2 at 1300 bps**, cut into 1-second chunks of one LoRa packet each and encrypted end to end
+  like text. The receiver reports which chunks arrived, and the sender resends only the missing ones.
+- **Files** are saved as `/cardxat/NNNN_<peer>_<i|o>.c2`, standard Codec2 files. `/voices` lists them and
+  `/play N` replays one. On a PC:
+  `c2dec 1300 0007_….c2 out.raw && play -t raw -r 8000 -e signed -b 16 -c 1 out.raw`.
+- **Airtime:** each second of voice is a ~2.5 s packet, so a 10 s message takes ~25 s to deliver. Within
+  the 10% duty cycle that's roughly **2 minutes of voice per hour per node**, relays included.
+  Text remains far cheaper on air.
+- **Half duplex:** while recording or playing, the radio keeps only the last packet that arrives.
+- **No SD card:** voice still sends and plays, but nothing is saved.
+- **Tuning:** speaker loudness is `VOLUME` at the top of `src/main.cpp`.
 
 ## Disaster use
 
@@ -157,7 +177,7 @@ Limits per ERC Rec 70-03 Annex 1 and EU Decision 2018/1538. Check your national 
   for messaging. GPS is only used for `/loc`. A cold fix takes about 23 s outdoors and often fails indoors.
 - **Pair before you need it.** Accept contacts and compare fingerprints in person now. Contacts,
   keys, name and passphrase are kept in flash and survive dead batteries and reboots.
-- **What a reboot loses:** message history and unsent messages, which live in RAM only.
+- **What a reboot loses:** text history and unsent messages, which live in RAM only. Voice messages are kept on the SD card.
 - **Is someone reachable?** The header shows when each contact was last heard. Beacons every ~5 min
   keep it fresh even when nobody types.
 - **Red message** = no ACK after 3 tries (~45 s). Move higher or outdoors, or wait for a relay, then resend.
