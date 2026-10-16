@@ -4,6 +4,9 @@ A standalone **[MeshCore](https://github.com/meshcore-dev/MeshCore)** client for
 + Cap LoRa-1262** (SX1262, ATGM336H GPS). It chats with any MeshCore user and needs no phone, and it adds
 push-to-talk voice messages between cardcore devices.
 
+> **Status:** it builds and passes the end-to-end simulation against the real MeshCore library, but it
+> hasn't been run on a physical Cardputer yet. Test it before you rely on it.
+
 <p>
 <img src="docs/chat.png" width="400" alt="Chat with alice: received messages in cyan, delivered in green, a voice message each way, a shared GPS location, one still sending in white">
 <img src="docs/channel.png" width="400" alt="The Public channel: alice asks for a medic, bob answers">
@@ -21,24 +24,11 @@ pio run -t upload        # hold G0 while plugging in if upload doesn't start
 Or, without building: download `cardcore-<version>.bin` from [Releases](https://github.com/vdo/cardcore/releases) and flash it at offset 0x0
 with `esptool.py --chip esp32s3 write_flash 0x0 cardcore-<version>.bin` or the browser-based [ESP flasher](https://espressif.github.io/esptool-js/).
 
-## Why MeshCore, not Meshtastic?
-The goal is a **long-range encrypted text walkie-talkie** that keeps working when everything else is down.
-
-- **No phone, no infrastructure.** cardcore is the whole client: keyboard, screen and GPS. It needs no
-  app, account, internet, gateway or MQTT.
-- **Routes instead of flooding.** MeshCore floods a message only to discover the path, then sends
-  straight along it. Client devices don't repeat; dedicated repeaters do. That's much less airtime
-  than flooding every message.
-- **Quiet.** There are no telemetry, position or node-info broadcasts. cardcore announces itself only
-  at boot, when you accept someone and when you type `/advert`.
-- **Existing networks.** It uses MeshCore repeaters and room servers already on hills and rooftops, and
-  talks to people using the MeshCore phone apps.
-
 ## First boot
 <img src="docs/setup.png" width="360" align="right" alt="First boot: typing the name">
 
 1. Type your name and press Enter. Your device sends an advert so others can find you.
-2. People nearby show up as `ADVERT name 1a2b3c4d 1hops  /ok /no`. `/ok` adds the newest one, and
+2. People nearby show up as `ADVERT name 1a2b3c4d 1 hop  /ok /no`. `/ok` adds the newest one, and
    `/add name` adds a specific one. Check keys in person: `/fp` shows yours and the contact's.
 3. Press Tab to reach the contact, type and press Enter. You're in the **#Public** channel from the start.
 
@@ -57,10 +47,11 @@ The goal is a **long-range encrypted text walkie-talkie** that keeps working whe
 | tap **G0** | replay the latest voice message in this chat; tap again to stop |
 | `/voices` `/play n` | list saved voice messages in this chat, play #n |
 | `/del` `/name x` | delete the current contact; change your name |
+| `/help` | list the commands |
 
 Message colours: cyan = received, white = sending, green = delivered (ACKed), red = failed after
 3 tries (the last try floods), grey = sent to a channel (channels have no ACKs).
-The header shows the chat, its route (`flood` = no route known yet, `2h` = direct path over 2 hops), when
+The header shows the chat, its route (`direct`, `2 hops`, or `flood` when no route is known yet), when
 the contact was last heard, `ADV` when adverts are waiting, the RSSI of the last packet and the GPS satellite count.
 
 The screen sleeps after 30 s. The first key press only wakes it, and incoming messages or adverts wake it too.
@@ -74,10 +65,10 @@ other MeshCore apps ignore it.
 - **Codec2 at 1300 bps**, cut into 0.84 s chunks, one MeshCore request each. The chunks are end-to-end
   encrypted with the contact's MeshCore key, with a ChaCha20 layer inside: MeshCore's AES-ECB would
   otherwise show repeated frames such as silence. The receiver reports which chunks arrived, and the sender
-  resends only the missing ones. The first chunk goes alone as a probe, so a contact who can't play voice
-  costs just one packet.
+  resends only the missing ones. The first chunk goes alone as a probe, so for a contact who can't play
+  voice only that one chunk is sent (with up to 3 retries).
 - **Needs a known route.** Send a text first so MeshCore learns the path from its ACK. Voice never floods
-  the mesh.
+  the mesh: if the route is lost mid-message, the message fails instead.
 - **Files** are saved as `/cardcore/NNNN_<peer>_<i|o>.c2`, standard Codec2 files. On a PC:
   `c2dec 1300 0007_….c2 out.raw && play -t raw -r 8000 -e signed -b 16 -c 1 out.raw`.
 - **Airtime:** each chunk is about 1.06 s on air for 0.84 s of speech, so a 10 s message takes about
@@ -117,6 +108,19 @@ How these were worked out:
 Li-ion loses a lot of capacity below 0 °C. Keep the bank inside your jacket.
 
 ### Range
+With MeshCore, **how far you reach depends on the network around you** more than on your radio:
+- **Repeaters:** are there any within range of you and of the person you're writing to?
+- **Load:** how busy is the mesh right now?
+- **Routes:** which paths has MeshCore already learned?
+
+Two people on opposite sides of a city can talk through a rooftop repeater. The same two people with no
+repeater nearby are limited to one hop between their own devices.
+
+The header shows the route to each contact: `direct`, `3 hops`, or `flood` while none is known yet.
+
+Everything below is about **one hop**, from your Cardputer to the next device, whether that's the
+other person or the nearest repeater.
+
 Link budget: +22 dBm out, about −130 dBm sensitivity at SF8/62.5 kHz, and 0–3 dBi antennas give
 **~152–158 dB** of allowed path loss for each hop.
 
@@ -135,14 +139,18 @@ at 1.5 m is ~10 km; with one antenna at 30 m it's ~28 km.
 
 Getting more range:
 - **Go higher.** Getting the antenna from 1.5 m up to 10 m does more than any setting.
-- **Use repeaters.** Any MeshCore repeater in range relays for you, along learned paths of up to 64 hops.
+- **Reach a repeater.** Any MeshCore repeater in range relays for you, along learned paths of up to 64 hops.
+  If your messages only ever go out as `flood` and end red, probably no repeater hears you: move higher
+  or outdoors.
+- **Busy mesh?** Packets collide and MeshCore's airtime budget holds them back. Short texts get through
+  far more reliably than voice, so keep voice for when it's quiet or the route is short.
 - **No repeaters?** In a disaster, `/repeat on` on every Cardputer makes them relay for each other.
   Better still, put a spare Cardputer with `/repeat on`, or a cheap MeshCore repeater board, on a rooftop
   or hill with a power bank. With its screen asleep a Cardputer lasts about a week.
 - **Mind the antenna.** Keep it vertical, away from your body and metal. A 5–6 dBi collinear antenna on
   a mast at the repeater is the next upgrade.
 - **Change the settings** (every node must match): `/radio 869.618 62.5 10 5` gains about 5 dB (≈1.7×
-  range in open terrain) for about 2.5× the airtime. It also takes you off the public mesh.
+  range in open terrain) for 4× the airtime. It also takes you off the public mesh.
 
 Time on air at SF8/62.5 kHz: ACK 0.16 s, 30-character message 0.4 s, voice chunk 1.06 s. MeshCore
 spaces out transmissions with its own airtime budget.
@@ -164,7 +172,7 @@ licence-free sub-bands are usable for portable peer-to-peer radios:
 cardcore uses MeshCore's EU/UK default, **869.618 MHz / 62.5 kHz / SF8**. That puts it on the public mesh
 and its repeaters, in the upper part of the high-power sub-band and clear of the LoRaWAN downlink.
 
-A group that wants its own channel can switch every device to `/radio 869.435 62.5 9 5`, the quiet
+A group that wants its own frequency can switch every device to `/radio 869.435 62.5 9 5`, the quiet
 lower edge below the LoRaWAN downlink. You lose the public repeaters, though. Interference is local: a
 nearby gateway or alarm system can make another slot quieter where you are.
 Limits per ERC Rec 70-03 Annex 1 and EU Decision 2018/1538. Check your national rules.

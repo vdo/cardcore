@@ -101,6 +101,10 @@ uint32_t idOf(const ContactInfo &c) {
   return v;
 }
 bool isChan(uint32_t id) { return (id & CHAN) == CHAN; }
+String hops(uint8_t path_len) {
+  int n = path_len & 63;
+  return n == 0 ? String("direct") : String(n) + (n == 1 ? " hop" : " hops");
+}
 String hex(const uint8_t *b, int n) {
   String s;
   char h[3];
@@ -189,7 +193,7 @@ struct Node : BaseChatMesh {
       if (p.id.matches(c.id)) return;
     if (pending.size() >= 16) pending.erase(pending.begin());
     pending.push_back(c);
-    sys("ADVERT " + String(c.name) + " " + hex(c.id.pub_key, 4) + " " + String(path_len & 63) + "hops  /ok /no");
+    sys("ADVERT " + String(c.name) + " " + hex(c.id.pub_key, 4) + " " + hops(path_len) + "  /ok /no");
   }
 
   void onContactPathUpdated(const ContactInfo &) override { contactsDirty = true; }
@@ -403,6 +407,10 @@ void sendText(const String &s) {
 }
 
 void pumpVoice(Out &o, ContactInfo &c) {
+  if (c.out_path_len == OUT_PATH_UNKNOWN) {  // route lost: fail rather than flood the mesh with voice
+    o.next = 32;
+    return;
+  }
   if (o.next >= 32 || node.outbound()) return;  // round sent, or pace: one request queued at a time
   uint32_t rest = o.need >> o.next << o.next;
   if (!rest) {
@@ -683,10 +691,9 @@ void draw() {
   else {
     auto all = convs();
     int idx = std::find(all.begin(), all.end(), cur) - all.begin();
-    cv.printf("%.12s %d/%d", convName(cur).c_str(), idx + 1, (int)all.size());
+    cv.printf("%.10s %d/%d", convName(cur).c_str(), idx + 1, (int)all.size());
     if (ContactInfo *c = node.byId(cur)) {
-      if (c->out_path_len == OUT_PATH_UNKNOWN) cv.print(" flood");
-      else cv.printf(" %dh", c->out_path_len & 63);
+      cv.print(c->out_path_len == OUT_PATH_UNKNOWN ? " flood" : (" " + hops(c->out_path_len)).c_str());
       if (heard.count(cur)) {
         uint32_t s = (millis() - heard[cur]) / 1000;
         if (s < 120) cv.printf(" %lus", (unsigned long)s);
@@ -715,8 +722,15 @@ void draw() {
                                     : WHITE;
     String pre = !l.peer ? "* " : l.state == '<' ? "< " : "> ";
     std::vector<String> chunks;
-    for (size_t p = 0; p == 0 || p < l.text.length(); p += COLS)
-      chunks.push_back((p ? "  " : pre) + l.text.substring(p, p + COLS));
+    size_t p = 0, len = l.text.length();
+    do {  // wrap at a space when there is one
+      size_t e = std::min(len, p + COLS);
+      int sp = e < len ? l.text.lastIndexOf(' ', e) : -1;
+      if (sp > (int)p) e = sp + 1;
+      chunks.push_back((p ? "  " : pre) + l.text.substring(p, e));
+      p = e;
+    } while (p < len);
+    if (!rows.empty() && rows.size() + chunks.size() > ROWS) break;  // only whole messages at the top
     for (int j = (int)chunks.size() - 1; j >= 0 && (int)rows.size() < ROWS; j--) rows.push_back({col, chunks[j]});
   }
   for (int i = 0; i < (int)rows.size(); i++) {

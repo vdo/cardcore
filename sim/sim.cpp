@@ -182,6 +182,7 @@ struct {
 } air;
 struct SimRadio : mesh::Radio {
   int me;
+  float rssi = 0;  // nothing heard yet
   explicit SimRadio(int i) : me(i) {}
   int recvRaw(uint8_t *b, int sz) override {
     auto &q = air.q[me];
@@ -189,6 +190,7 @@ struct SimRadio : mesh::Radio {
     int n = std::min<int>(sz, q.front().size());
     memcpy(b, q.front().data(), n);
     q.erase(q.begin());
+    rssi = -97;
     return n;
   }
   uint32_t getEstAirtimeFor(int len) override { return 60 + len * 5; }  // roughly SF8 / 62.5 kHz
@@ -200,7 +202,7 @@ struct SimRadio : mesh::Radio {
   bool isSendComplete() override { return true; }
   void onSendFinished() override {}
   bool isInRecvMode() const override { return true; }
-  float getLastRSSI() const override { return -97; }
+  float getLastRSSI() const override { return rssi; }
   float getLastSNR() const override { return 8; }
 };
 struct Module {

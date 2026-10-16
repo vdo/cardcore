@@ -48,6 +48,7 @@ struct String : std::string {
   void remove(size_t i) { erase(i); }
   int indexOf(char c, size_t from = 0) const { return find(c, from) == npos ? -1 : (int)find(c, from); }
   bool startsWith(const String &p) const { return rfind(p, 0) == 0; }
+  int lastIndexOf(char c, size_t from) const { return rfind(c, from) == npos ? -1 : (int)rfind(c, from); }
   long toInt() const { return atol(c_str()); }
   void trim() {
     erase(0, find_first_not_of(' '));
