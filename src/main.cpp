@@ -1,104 +1,115 @@
-// cardxat: E2E-encrypted LoRa chat for Cardputer ADV + Cap LoRa-1262
+// cardcore: standalone MeshCore client for M5Stack Cardputer ADV + Cap LoRa-1262
 #include <M5Cardputer.h>
 #include <utility/PI4IOE5V6408_Class.hpp>
-#include <RadioLib.h>
+#include <Mesh.h>
+#include <helpers/BaseChatMesh.h>
+#include <helpers/ArduinoHelpers.h>
+#include <helpers/ESP32Board.h>
+#include <helpers/SimpleMeshTables.h>
+#include <helpers/StaticPoolPacketManager.h>
+#include <helpers/radiolib/CustomSX1262Wrapper.h>
+#include <target.h>
 #include <Preferences.h>
 #include <TinyGPSPlus.h>
-#include <bootloader_random.h>
+#include <RTClib.h>
 #include <SD.h>
+#include <ChaCha.h>
 #include <codec2.h>
+#include <bootloader_random.h>
 #include <algorithm>
+#include <map>
 #include <vector>
-#include "proto.h"
 
-// EU868 sub-band h1.7 (869.4-869.65 MHz): the only one with 500 mW ERP / 10% duty.
-// Sits in its quiet lower edge: below LoRaWAN RX2 (869.525/125k, 27 dBm gateways) and Meshtastic's
-// centre, far from MeshCore (869.618/62.5k). SF9/62.5k = same link budget as SF10/125k, ~1.1 s per 100 B.
-#define FREQ 869.435
-#define BW 62.5
-#define SF 9  // SF10/SF11: +2.5/+5 dB range but 2.2x/4x airtime -> raise ACK_MS to ~30000/~60000
-#define CR 5
-#define SYNC 0x12
-#define TXPWR 22
-#define TCXO_V 3.0
-
-// Cap LoRa-1262 on Cardputer ADV
-#define P_NSS 5
-#define P_IRQ 4
-#define P_RST 3
-#define P_BUSY 6
-#define P_SCK 40
-#define P_MISO 39
-#define P_MOSI 14
+// Radio pins and MeshCore EU defaults (869.618 MHz / 62.5 kHz / SF8) are in platformio.ini
+#define P_SD_CS 12  // SD shares the LoRa SPI bus
 #define GPS_RX 15
 #define GPS_TX 13
 #define GPS_BAUD 115200
-#define P_SD_CS 12  // SD shares the LoRa SPI bus
 #define VOLUME 200  // speaker 0-255
 
-constexpr uint8_t TTL = 3;
-constexpr uint32_t BEACON_MS = 5 * 60 * 1000, ACK_MS = 15000, SCREEN_MS = 30000;
-constexpr int TRIES = 3, ROWS = 11, COLS = 38, MAXCONTACTS = 32;
-// Codec2 1300 bps: 40 ms frames of 320 samples @ 8 kHz -> 7 bytes. 25 frames (1 s) per packet.
-constexpr int SPF = 320, VBYTES = 7, VFRAMES = 25, VMAX_S = 20;
-constexpr size_t VCHUNK = VFRAMES * VBYTES;
+constexpr uint32_t SCREEN_MS = 30000, CHAN = 0xFFFFFF00;  // line/conversation ids: CHAN | slot = channel
+constexpr int TRIES = 3, ROWS = 11, COLS = 38, MAXINPUT = 150;
+// Voice: Codec2 1300 bps, 40 ms of 8 kHz audio -> 7 bytes. Sent as MeshCore requests of our own type,
+// 21 frames (0.84 s) each: type(1) id(8) seq|last(1) total(1) nframes(1) frames. nframes is explicit because
+// MeshCore pads request payloads to the AES block size.
+constexpr uint8_t REQ_VOICE = 0xCC;
+constexpr int SPF = 320, VBYTES = 7, VFRAMES = 21, VMAX_S = 20;
+constexpr size_t VCHUNK = VFRAMES * VBYTES, VHDR = 12, VMAXCHUNKS = (VMAX_S * 25 + VFRAMES - 1) / VFRAMES;
+static_assert(4 + VHDR + VCHUNK + CIPHER_MAC_SIZE + CIPHER_BLOCK_SIZE - 1 <= MAX_PACKET_PAYLOAD,
+              "a voice chunk must fit one MeshCore request (see Mesh::createDatagram)");
+static const uint8_t PUBLIC_PSK[16] = {139, 51, 135, 233, 197, 205, 234, 106, 201, 229, 237, 186, 161, 21, 205, 114};
 
 SET_LOOP_TASK_STACK_SIZE(32 * 1024);  // codec2 needs far more than the default 8 KB
 
-struct Contact {
-  char name[17];
-  uint8_t pub[32], key[32];
-  uint32_t id, seen;
-};
-// peer 0 = system; state '<' in, '?' sending, '+' acked, '!' failed
+// peer 0 = system; state '<' in, '?' sending, '+' acked, '!' failed, 's' sent (channels: no acks)
 struct Line {
   uint32_t peer, msgId;
   char state;
   String text;
 };
-struct Out {
-  uint32_t msgId, peer;
-  String text;
+struct Out {  // waits for its ack
+  uint32_t peer, msgId, ts, ack, at;
   int tries;
-  uint32_t at;
-  std::vector<uint8_t> voice;  // empty = text message
-  uint32_t need;               // chunks not yet acked (text: 1)
+  String text;
+  std::vector<uint8_t> voice;  // empty = text
+  uint64_t vid;
+  uint32_t need;  // voice chunks not acked yet
+  int next;       // next chunk to send this round; 32 = round sent, waiting
+  bool probed;    // receiver answered once (so it speaks cardcore voice)
 };
 struct RxVoice {
-  uint32_t peer, msgId, got;
+  uint32_t peer, got;
+  uint64_t vid;
   uint8_t total;
   size_t len;
   std::vector<uint8_t> data;
 };
-struct Tx {
-  uint8_t b[MAXPKT];
-  size_t n;
-  uint32_t at;
+
+struct HwRng : mesh::RNG {
+  void random(uint8_t *dest, size_t sz) override { esp_fill_random(dest, sz); }
 };
 
-SX1262 radio = new Module(P_NSS, P_IRQ, P_RST, P_BUSY);
+ESP32Board board;
+CustomSX1262 radio = new Module(P_LORA_NSS, P_LORA_DIO_1, P_LORA_RESET, P_LORA_BUSY, SPI);
+CustomSX1262Wrapper radio_driver(radio, board);
+ESP32RTCClock rtc_clock;
+SensorManager sensors;
+HwRng rng;
+SimpleMeshTables tables;
 TinyGPSPlus gps;
-CODEC2 *c2;
 Preferences prefs;
 M5Canvas cv(&M5Cardputer.Display);
+CODEC2 *c2;
 
-uint8_t sec[32], pub[32], netKey[32], bootSeed[16];
-uint64_t ctr;
-uint32_t me, nextBeacon, lastDraw, lastActive;
-String myName, netPass, input, status;
-std::vector<Contact> contacts, pending;
-std::vector<uint32_t> ignored, seen;
+uint32_t cur, lastDraw, lastActive, lastSave, lastAdvert, lastClock;
+String myName, input, status;
+std::vector<ContactInfo> pending;
+std::vector<uint32_t> ignored;
 std::vector<Line> lines;
 std::vector<Out> outbox;
 std::vector<RxVoice> rxv;
-std::vector<Tx> txq;
-size_t cur;
-int lastRssi;
-volatile bool rxFlag;
-bool dirty = true, asleep, sd;
-
-void IRAM_ATTR onRx() { rxFlag = true; }
+std::vector<uint8_t> toPlay;
+std::map<uint32_t, uint32_t> heard;  // peer -> millis
+bool dirty = true, asleep, sd, repeat, contactsDirty;
 void draw();
+String voiceLabel(size_t bytes, uint32_t num);
+uint32_t saveVoice(uint32_t peer, char dir, const std::vector<uint8_t> &d);
+
+uint32_t idOf(const ContactInfo &c) {
+  uint32_t v;
+  memcpy(&v, c.id.pub_key, 4);
+  return v;
+}
+bool isChan(uint32_t id) { return (id & CHAN) == CHAN; }
+String hex(const uint8_t *b, int n) {
+  String s;
+  char h[3];
+  for (int i = 0; i < n; i++) {
+    snprintf(h, sizeof h, "%02x", b[i]);
+    s += h;
+  }
+  return s;
+}
 
 void wake() {
   lastActive = millis();
@@ -111,103 +122,11 @@ void wake() {
 
 void addLine(uint32_t peer, uint32_t msgId, char state, const String &text) {
   lines.push_back({peer, msgId, state, text});
-  if (lines.size() > 150) lines.erase(lines.begin());
-  wake();  // incoming msg / request lights the screen
+  if (lines.size() > 200) lines.erase(lines.begin());
+  wake();  // incoming msg / advert lights the screen
   dirty = true;
 }
 void sys(const String &s) { addLine(0, 0, '*', s); }
-
-String fpStr(const uint8_t p[32]) {
-  uint8_t fp[8];
-  fingerprint(fp, p);
-  char s[20];
-  snprintf(s, sizeof s, "%02x%02x %02x%02x %02x%02x %02x%02x", fp[0], fp[1], fp[2], fp[3], fp[4], fp[5], fp[6], fp[7]);
-  return s;
-}
-
-String clean(const uint8_t *b, size_t n) {  // network data -> printable ASCII
-  String s;
-  for (size_t i = 0; i < n; i++) s += (b[i] >= 32 && b[i] < 127) ? (char)b[i] : '?';
-  return s;
-}
-
-Contact *find(std::vector<Contact> &v, uint32_t id) {
-  for (auto &c : v)
-    if (c.id == id) return &c;
-  return nullptr;
-}
-
-void save() { prefs.putBytes("contacts", contacts.data(), contacts.size() * sizeof(Contact)); }
-
-bool seenBefore(uint32_t h) {
-  for (auto s : seen)
-    if (s == h) return true;
-  seen.push_back(h);
-  if (seen.size() > 64) seen.erase(seen.begin());
-  return false;
-}
-
-// Unique per key: boot-random prefix + counter, so a weak/repeating RNG can't reuse a nonce
-void makeNonce(uint8_t n[24]) {
-  memcpy(n, bootSeed, 16);
-  ctr++;
-  memcpy(n + 16, &ctr, 8);
-}
-
-void queue(const uint8_t *b, size_t n, uint32_t delay) {
-  if (txq.size() >= 32) return;  // ponytail: drop when flooded; no duty-cycle accounting, fine for chat volumes
-  Tx t;
-  memcpy(t.b, b, n);
-  t.n = n;
-  t.at = millis() + delay;
-  txq.push_back(t);
-}
-
-void send(uint8_t type, uint32_t dst, const uint8_t *body, size_t len, const uint8_t *key, uint32_t delay = 0) {
-  if (netPass.isEmpty()) return;
-  uint8_t nonce[24], b[MAXPKT];
-  makeNonce(nonce);
-  size_t n = seal(b, TTL, nonce, netKey, type, me, dst, body, len, key);
-  if (!n) return sys("too long");
-  seenBefore(get32(b + n - 16));  // don't relay our own echo
-  queue(b, n, delay);
-}
-
-void beacon() {
-  uint8_t b[48];
-  memcpy(b, pub, 32);
-  memcpy(b + 32, myName.c_str(), myName.length());
-  send(T_BEACON, BCAST, b, 32 + myName.length(), nullptr);
-  nextBeacon = millis() + BEACON_MS + random(30000);
-}
-
-void sendMsg(Out &o) {
-  Contact *c = find(contacts, o.peer);
-  if (!c) {  // contact deleted
-    o.tries = TRIES;
-    return;
-  }
-  if (o.voice.empty()) {
-    uint8_t b[4 + MAXTEXT];
-    put32(b, o.msgId);
-    memcpy(b + 4, o.text.c_str(), o.text.length());
-    send(T_MSG, o.peer, b, 4 + o.text.length(), c->key);
-  } else {  // resend only the chunks not acked yet; the last one asks the receiver for an ack
-    size_t total = (o.voice.size() + VCHUNK - 1) / VCHUNK, last = 31 - __builtin_clz(o.need);
-    for (size_t i = 0; i < total; i++) {
-      if (!(o.need >> i & 1)) continue;
-      uint8_t b[6 + VCHUNK];
-      size_t n = std::min(VCHUNK, o.voice.size() - i * VCHUNK);
-      put32(b, o.msgId);
-      b[4] = i | (i == last ? 0x80 : 0);
-      b[5] = total;
-      memcpy(b + 6, o.voice.data() + i * VCHUNK, n);
-      send(T_VOICE, o.peer, b, 6 + n, c->key);
-    }
-  }
-  o.tries++;
-  o.at = millis() + ACK_MS + (o.voice.empty() ? 0 : __builtin_popcount(o.need) * 2600);  // + airtime
-}
 
 void setState(uint32_t peer, uint32_t msgId, char state) {
   for (auto &l : lines)
@@ -215,11 +134,319 @@ void setState(uint32_t peer, uint32_t msgId, char state) {
   dirty = true;
 }
 
+struct Node : BaseChatMesh {
+  Node() : BaseChatMesh(radio_driver, *new ArduinoMillis(), rng, rtc_clock, *new StaticPoolPacketManager(16), tables) {}
+
+  void begin(const mesh::LocalIdentity &id) {
+    BaseChatMesh::begin();
+    self_id = id;
+  }
+  const mesh::LocalIdentity &me() const { return self_id; }
+  int outbound() const { return _mgr->getOutboundTotal(); }
+  void syncClockFromContacts() { bootstrapRTCfromContacts(); }
+
+  ContactInfo *byId(uint32_t id) {
+    uint8_t p[4];
+    memcpy(p, &id, 4);
+    return isChan(id) ? nullptr : lookupContactByPubKey(p, 4);
+  }
+  ContactInfo *at(int j) {  // j-th real contact (anon slots skipped)
+    ContactInfo tmp;
+    return getContactByIdx(MAX_ANON_CONTACTS + j, tmp) ? lookupContactByPubKey(tmp.id.pub_key, PUB_KEY_SIZE) : nullptr;
+  }
+
+  void advert() {
+    auto pkt = createSelfAdvert(myName.c_str());
+    if (pkt) sendFlood(pkt, 1500);
+    lastAdvert = millis();
+  }
+
+  // Encrypts or decrypts voice frames in place. MeshCore's own layer is AES-ECB, which would show
+  // repeated Codec2 frames (silence); a ChaCha stream under it hides them at zero byte cost.
+  void voiceCrypt(const ContactInfo &c, uint64_t vid, uint8_t seq, uint8_t *b, size_t n) {
+    uint8_t key[32], ctr[8] = {(uint8_t)(seq * 4)};  // 4 blocks = 256 B >= one chunk
+    mesh::Utils::sha256(key, 32, c.getSharedSecret(self_id), 32, (const uint8_t *)"cardcore-voice", 14);
+    ChaCha cha;
+    cha.setKey(key, 32);
+    cha.setIV(reinterpret_cast<const uint8_t *>(&vid), 8);
+    cha.setCounter(ctr, 8);
+    cha.encrypt(b, b, n);
+    cha.clear();
+  }
+
+ protected:
+  bool allowPacketForward(const mesh::Packet *) override { return repeat; }
+  bool shouldAutoAddContactType(uint8_t) const override { return false; }  // adverts become /ok requests
+
+  void onDiscoveredContact(ContactInfo &c, bool is_new, uint8_t path_len, const uint8_t *) override {
+    heard[idOf(c)] = millis();
+    if (!is_new) {
+      contactsDirty = true;
+      return;
+    }
+    if (c.type != ADV_TYPE_CHAT || std::count(ignored.begin(), ignored.end(), idOf(c))) return;
+    for (auto &p : pending)
+      if (p.id.matches(c.id)) return;
+    if (pending.size() >= 16) pending.erase(pending.begin());
+    pending.push_back(c);
+    sys("ADVERT " + String(c.name) + " " + hex(c.id.pub_key, 4) + " " + String(path_len & 63) + "hops  /ok /no");
+  }
+
+  void onContactPathUpdated(const ContactInfo &) override { contactsDirty = true; }
+
+  ContactInfo *processAck(const uint8_t *data) override {
+    for (size_t i = 0; i < outbox.size(); i++) {
+      Out &o = outbox[i];
+      if (o.voice.empty() && memcmp(data, &o.ack, 4) == 0) {
+        uint32_t peer = o.peer;
+        setState(peer, o.msgId, '+');
+        outbox.erase(outbox.begin() + i);
+        heard[peer] = millis();
+        return byId(peer);
+      }
+    }
+    return nullptr;
+  }
+
+  void onMessageRecv(const ContactInfo &c, mesh::Packet *, uint32_t ts, const char *text) override {
+    uint32_t peer = idOf(c);
+    heard[peer] = millis();
+    for (auto &l : lines)
+      if (l.peer == peer && l.msgId == ts && l.state == '<') return;  // a retry we already have
+    addLine(peer, ts, '<', text);
+    if (cur != peer) sys(String("msg from ") + c.name + " (Tab)");
+    M5Cardputer.Speaker.tone(3000, 60);
+  }
+  void onSignedMessageRecv(const ContactInfo &c, mesh::Packet *p, uint32_t ts, const uint8_t *,
+                           const char *text) override {
+    onMessageRecv(c, p, ts, text);  // room server posts
+  }
+  void onCommandDataRecv(const ContactInfo &, mesh::Packet *, uint32_t, const char *) override {}
+  void onCLICommandRecv(const ContactInfo &, mesh::Packet *, uint32_t, const char *, char *) override {}
+
+  void onChannelMessageRecv(const mesh::GroupChannel &ch, mesh::Packet *, uint32_t ts, const char *text) override {
+    int slot = findChannelIdx(ch);
+    if (slot >= 0) addLine(CHAN | slot, ts, '<', text);  // text is "name: msg"
+  }
+
+  // Voice chunk in, chunk bitmap out (only at the end of a round, to save airtime)
+  uint8_t onContactRequest(const ContactInfo &c, uint32_t ts, const uint8_t *d, uint8_t len, uint8_t *reply) override {
+    if (len < VHDR + VBYTES || d[0] != REQ_VOICE) return 0;
+    uint64_t vid;
+    memcpy(&vid, d + 1, 8);
+    uint8_t seq = d[9] & 0x7f, total = d[10];
+    bool last = d[9] & 0x80;
+    size_t n = d[11] * VBYTES;
+    if (!total || total > VMAXCHUNKS || seq >= total || !n || n > VCHUNK || VHDR + n > len) return 0;
+    uint32_t peer = idOf(c), full = (1u << total) - 1, got = full;
+    heard[peer] = millis();
+    bool have = false;
+    for (auto &l : lines) have |= l.peer == peer && l.msgId == (uint32_t)vid && l.state == '<';
+    if (!have) {
+      RxVoice *v = nullptr;
+      for (auto &r : rxv)
+        if (r.peer == peer && r.vid == vid) v = &r;
+      if (!v) {
+        if (rxv.size() >= 4) rxv.erase(rxv.begin());
+        rxv.push_back({peer, 0, vid, total, 0, std::vector<uint8_t>(total * VCHUNK)});
+        v = &rxv.back();
+      }
+      if (total != v->total) return 0;
+      uint8_t *dst = v->data.data() + seq * VCHUNK;
+      memcpy(dst, d + VHDR, n);
+      voiceCrypt(c, vid, seq, dst, n);
+      if (seq == total - 1) v->len = seq * VCHUNK + n;
+      got = v->got |= 1u << seq;
+      if (got == full) {
+        std::vector<uint8_t> voice(v->data.begin(), v->data.begin() + v->len);
+        rxv.erase(rxv.begin() + (v - rxv.data()));
+        addLine(peer, (uint32_t)vid, '<', voiceLabel(voice.size(), saveVoice(peer, 'i', voice)));
+        if (cur != peer) sys(String("voice from ") + c.name + " (Tab)");
+        toPlay = voice;  // played from loop() once our reply is out
+      }
+    }
+    if (!last && got != full) return 0;
+    memcpy(reply, &ts, 4);
+    reply[4] = REQ_VOICE;
+    memcpy(reply + 5, &vid, 8);
+    memcpy(reply + 13, &got, 4);
+    return 17;
+  }
+
+  void onContactResponse(const ContactInfo &c, const uint8_t *d, uint8_t len) override {
+    if (len < 17 || d[4] != REQ_VOICE) return;
+    uint64_t vid;
+    uint32_t got, peer = idOf(c);
+    memcpy(&vid, d + 5, 8);
+    memcpy(&got, d + 13, 4);
+    heard[peer] = millis();
+    for (size_t i = 0; i < outbox.size(); i++) {
+      Out &o = outbox[i];
+      if (o.voice.empty() || o.vid != vid) continue;
+      o.probed = true;
+      o.need &= ~got;
+      o.next = 0;  // send what's still missing right away
+      if (!o.need) {
+        setState(peer, o.msgId, '+');
+        outbox.erase(outbox.begin() + i);
+      }
+      return;
+    }
+  }
+
+  uint32_t calcFloodTimeoutMillisFor(uint32_t airtime) const override { return 500 + 16 * airtime; }
+  uint32_t calcDirectTimeoutMillisFor(uint32_t airtime, uint8_t path_len) const override {
+    return 500 + (airtime * 6 + 250) * ((path_len & 63) + 1);
+  }
+  void onSendTimeout() override {}  // our outbox keeps its own timers
+};
+Node node;
+
+// ---- persistence (NVS) ----
+constexpr size_t CREC = 32 + 32 + 3 + MAX_PATH_SIZE + 8;  // pub name type/flags/pathlen path advert_ts lastmod
+
+void saveContacts() {
+  std::vector<uint8_t> blob;
+  for (int j = 0; ContactInfo *c = node.at(j); j++) {
+    blob.resize(blob.size() + CREC);
+    uint8_t *p = blob.data() + blob.size() - CREC;
+    memcpy(p, c->id.pub_key, 32), p += 32;
+    memcpy(p, c->name, 32), p += 32;
+    *p++ = c->type, *p++ = c->flags, *p++ = c->out_path_len;
+    memcpy(p, c->out_path, MAX_PATH_SIZE), p += MAX_PATH_SIZE;
+    memcpy(p, &c->last_advert_timestamp, 4), p += 4;
+    memcpy(p, &c->lastmod, 4);
+  }
+  prefs.putBytes("contacts", blob.data(), blob.size());
+  contactsDirty = false;
+  lastSave = millis();
+}
+
+void loadContacts() {
+  std::vector<uint8_t> blob(prefs.getBytesLength("contacts"));
+  prefs.getBytes("contacts", blob.data(), blob.size());
+  for (size_t off = 0; off + CREC <= blob.size(); off += CREC) {
+    const uint8_t *p = blob.data() + off;
+    ContactInfo c;
+    memset(&c, 0, sizeof c);
+    c.id = mesh::Identity(p), p += 32;
+    memcpy(c.name, p, 32), p += 32;
+    c.type = *p++, c.flags = *p++, c.out_path_len = *p++;
+    memcpy(c.out_path, p, MAX_PATH_SIZE), p += MAX_PATH_SIZE;
+    memcpy(&c.last_advert_timestamp, p, 4), p += 4;
+    memcpy(&c.lastmod, p, 4);
+    node.addContact(c);
+  }
+}
+
+bool setChannel(int slot, const String &name, const uint8_t *secret, int len) {
+  ChannelDetails cd;
+  memset(&cd, 0, sizeof cd);
+  memcpy(cd.channel.secret, secret, len);
+  strlcpy(cd.name, name.c_str(), sizeof cd.name);
+  return node.setChannel(slot, cd);
+}
+
+void saveChannels() {  // "name hex\n" per joined channel, slot 0 = Public is built in
+  String s;
+  ChannelDetails cd;
+  for (int i = 1; i < MAX_GROUP_CHANNELS && node.getChannel(i, cd); i++)
+    if (cd.name[0]) s += String(cd.name) + " " + hex(cd.channel.secret, 32) + "\n";
+  prefs.putString("chans", s);
+}
+
+void loadChannels() {
+  setChannel(0, "Public", PUBLIC_PSK, 16);
+  String s = prefs.getString("chans", "");
+  int slot = 1;
+  for (int a = 0, nl; (nl = s.indexOf('\n', a)) > 0 && slot < MAX_GROUP_CHANNELS; a = nl + 1) {
+    String row = s.substring(a, nl);
+    int sp = row.indexOf(' ');
+    uint8_t secret[32];
+    if (sp < 0 || !mesh::Utils::fromHex(secret, 32, row.substring(sp + 1).c_str())) continue;
+    setChannel(slot++, row.substring(0, sp), secret, 32);
+  }
+}
+
+// ---- conversations: joined channels, then contacts ----
+std::vector<uint32_t> convs() {
+  std::vector<uint32_t> v;
+  ChannelDetails cd;
+  for (int i = 0; i < MAX_GROUP_CHANNELS && node.getChannel(i, cd); i++)
+    if (cd.name[0]) v.push_back(CHAN | i);
+  for (int j = 0; ContactInfo *c = node.at(j); j++) v.push_back(idOf(*c));
+  return v;
+}
+String convName(uint32_t id) {
+  if (isChan(id)) {
+    ChannelDetails cd;
+    node.getChannel(id & 0xff, cd);
+    return String(cd.name[0] == '#' ? "" : "#") + cd.name;
+  }
+  ContactInfo *c = node.byId(id);
+  return c ? c->name : "?";
+}
+
 void sendText(const String &s) {
-  if (contacts.empty()) return sys("no contacts yet");
-  Out o{esp_random(), contacts[cur].id, s.substring(0, MAXTEXT), 0, millis(), {}, 1};
-  addLine(o.peer, o.msgId, '?', o.text);
+  String t = s.substring(0, MAXINPUT);
+  if (isChan(cur)) {
+    ChannelDetails cd;
+    node.getChannel(cur & 0xff, cd);
+    uint32_t ts = rtc_clock.getCurrentTimeUnique();
+    if (!node.sendGroupMessage(ts, cd.channel, myName.c_str(), t.c_str(), t.length())) return sys("send failed");
+    return addLine(cur, ts, 's', t);
+  }
+  if (!node.byId(cur)) return sys("no contact selected (Tab)");
+  Out o{cur, esp_random(), rtc_clock.getCurrentTimeUnique(), 0, millis(), 0, t};
+  addLine(o.peer, o.msgId, '?', t);
   outbox.push_back(o);
+}
+
+void pumpVoice(Out &o, ContactInfo &c) {
+  if (o.next >= 32 || node.outbound()) return;  // round sent, or pace: one request queued at a time
+  uint32_t rest = o.need >> o.next << o.next;
+  if (!rest) {
+    o.next = 32;
+    return;
+  }
+  int i = __builtin_ctz(rest);
+  bool last = !o.probed || !(rest >> i >> 1);  // first round is a single probe chunk
+  size_t total = (o.voice.size() + VCHUNK - 1) / VCHUNK, n = std::min(VCHUNK, o.voice.size() - i * VCHUNK);
+  uint8_t b[VHDR + VCHUNK];
+  b[0] = REQ_VOICE;
+  memcpy(b + 1, &o.vid, 8);
+  b[9] = i | (last ? 0x80 : 0);
+  b[10] = total;
+  b[11] = n / VBYTES;
+  memcpy(b + VHDR, o.voice.data() + i * VCHUNK, n);
+  node.voiceCrypt(c, o.vid, i, b + VHDR, n);
+  uint32_t tag, est;
+  if (node.sendRequest(c, b, VHDR + n, tag, est) == MSG_SEND_FAILED) return;  // pool full, next loop
+  o.next = last ? 32 : i + 1;
+  if (last) o.at = millis() + est + 3000;
+}
+
+void pumpOutbox() {
+  for (size_t i = 0; i < outbox.size();) {
+    Out &o = outbox[i];
+    ContactInfo *c = node.byId(o.peer);
+    bool due = (int32_t)(millis() - o.at) >= 0, waiting = o.voice.empty() || o.next >= 32;
+    if (!c || (due && waiting && o.tries >= TRIES)) {
+      setState(o.peer, o.msgId, '!');
+      outbox.erase(outbox.begin() + i);
+      continue;
+    }
+    if (o.voice.size()) {
+      if (due && waiting) o.tries++, o.next = 0;  // no ack: resend the round
+      pumpVoice(o, *c);
+    } else if (due) {
+      if (o.tries == TRIES - 1) node.resetPathTo(*c);  // last try floods: the path may be stale
+      uint32_t est = 0;
+      if (node.sendMessage(*c, o.ts, o.tries, o.text.c_str(), o.ack, est) != MSG_SEND_FAILED) o.tries++;
+      o.at = millis() + std::max<uint32_t>(est, 3000);
+    }
+    i++;
+  }
 }
 
 // ---- voice ----
@@ -237,7 +464,7 @@ uint32_t saveVoice(uint32_t peer, char dir, const std::vector<uint8_t> &d) {
   uint32_t num = prefs.getUInt("vnum", 0) + 1;
   prefs.putUInt("vnum", num);
   char path[40];
-  snprintf(path, sizeof path, "/cardxat/%04lu_%08lx_%c.c2", (unsigned long)num, (unsigned long)peer, dir);
+  snprintf(path, sizeof path, "/cardcore/%04lu_%08lx_%c.c2", (unsigned long)num, (unsigned long)peer, dir);
   File f = SD.open(path, FILE_WRITE);
   if (!f) return 0;
   const uint8_t hdr[7] = {0xc0, 0xde, 0xc2, 0, 9, CODEC2_MODE_1300, 0};
@@ -252,14 +479,14 @@ String findVoice(uint32_t peer, uint32_t num, bool list = false) {
   String best;
   uint32_t bestNum = 0;
   std::vector<String> all;
-  File d = SD.open("/cardxat");
+  File d = SD.open("/cardcore");
   for (File f = d.openNextFile(); f; f = d.openNextFile()) {
     unsigned long n, p;
     if (sscanf(f.name(), "%lu_%lx", &n, &p) != 2) continue;
     if (list && p == peer) all.push_back(f.name());
     if (num ? n == num : p == peer && n > bestNum) {
       bestNum = n;
-      best = String("/cardxat/") + f.name();
+      best = String("/cardcore/") + f.name();
     }
   }
   std::sort(all.begin(), all.end());  // zero-padded, so text order = time order
@@ -267,24 +494,10 @@ String findVoice(uint32_t peer, uint32_t num, bool list = false) {
   return best;
 }
 
-bool pumpTx() {  // sends the first due packet
-  for (size_t i = 0; i < txq.size(); i++) {
-    if ((int32_t)(millis() - txq[i].at) < 0) continue;
-    int st = radio.transmit(txq[i].b, txq[i].n);
-    if (st != RADIOLIB_ERR_NONE) sys("tx err " + String(st));
-    txq.erase(txq.begin() + i);
-    rxFlag = false;  // DIO1 also fires on tx done
-    radio.startReceive();
-    return true;
-  }
-  return false;
-}
-
-// Blocking, like a walkie: the radio keeps only the last packet that arrives meanwhile
+// Blocking, like a walkie: the radio misses packets meanwhile
 void playVoice(const uint8_t *d, size_t n) {
   static int16_t pcm[3][SPF];  // speaker holds 2 queued, we fill the 3rd
   if (!c2) return;
-  while (pumpTx()) {}  // get our ack out first
   wake();
   status = "PLAY  tap G0 to stop";
   draw();
@@ -315,7 +528,7 @@ void playFile(const String &path) {
 }
 
 void playLatest() {
-  String path = sd && !contacts.empty() ? findVoice(contacts[cur].id, 0) : String();
+  String path = sd && !isChan(cur) ? findVoice(cur, 0) : String();
   if (path.isEmpty()) return sys("no saved voice messages here");
   playFile(path);
 }
@@ -335,11 +548,11 @@ void talk() {
   M5Cardputer.Speaker.end();  // mic and speaker share the I2S pins
   M5Cardputer.Mic.begin();
   int k = 0;
-  for (; M5Cardputer.BtnA.isPressed() && k < VMAX_S * VFRAMES; k++) {
+  for (; M5Cardputer.BtnA.isPressed() && k < VMAX_S * 25; k++) {
     M5Cardputer.Mic.record(pcm[k % 3], SPF, 8000);  // waits for a free slot, so k-2 is done
     if (k >= 2) encode(pcm[(k - 2) % 3]);
-    if (k % VFRAMES == 0) {
-      status = "REC " + String(k / VFRAMES) + "/" + String(VMAX_S) + "s";
+    if (k % 25 == 0) {
+      status = "REC " + String(k / 25) + "/" + String(VMAX_S) + "s";
       draw();
     }
     M5.update();
@@ -353,184 +566,102 @@ void talk() {
   dirty = true;
 
   if (k < 12) return playLatest();  // under 0.5 s = a tap: replay instead
-  if (contacts.empty()) return sys("no contacts yet");
+  ContactInfo *c = node.byId(cur);
+  if (!c) return sys("voice goes to a contact, not a channel");
+  if (c->out_path_len == OUT_PATH_UNKNOWN) return sys(String("no route to ") + c->name + " yet: send a text first");
   uint32_t chunks = (enc.size() + VCHUNK - 1) / VCHUNK;
-  Out o{esp_random(), contacts[cur].id, "", 0, millis(), enc, (1u << chunks) - 1};
-  o.text = voiceLabel(enc.size(), saveVoice(o.peer, 'o', enc));
-  addLine(o.peer, o.msgId, '?', o.text);
+  Out o{cur, 0, 0, 0, 0, 0, "", enc, 0, (1u << chunks) - 1, 0, false};
+  esp_fill_random(&o.vid, sizeof o.vid);
+  o.msgId = (uint32_t)o.vid;
+  addLine(o.peer, o.msgId, '?', voiceLabel(enc.size(), saveVoice(o.peer, 'o', enc)));
   outbox.push_back(o);
 }
 
-void ackVoice(const Contact &c, uint32_t msgId, uint32_t got) {
-  uint8_t a[8];
-  put32(a, msgId);
-  put32(a + 4, got);
-  send(T_ACK, c.id, a, 8, c.key);  // no delay: must leave before we start playing
-}
-
-void onVoice(Inner &in, const Contact &c, uint32_t msgId) {
-  uint8_t seq = in.body()[4] & 0x7f, total = in.body()[5];
-  bool last = in.body()[4] & 0x80;
-  size_t n = in.len() - 6;
-  if (!total || total > VMAX_S || seq >= total || !n || n > VCHUNK || n % VBYTES) return;
-  uint32_t full = (1u << total) - 1;
-  for (auto &l : lines)
-    if (l.peer == c.id && l.msgId == msgId && l.state == '<') return last ? ackVoice(c, msgId, full) : void();
-  RxVoice *v = nullptr;
-  for (auto &r : rxv)
-    if (r.peer == c.id && r.msgId == msgId) v = &r;
-  if (!v) {
-    if (rxv.size() >= 4) rxv.erase(rxv.begin());
-    rxv.push_back({c.id, msgId, 0, total, 0, std::vector<uint8_t>(total * VCHUNK)});
-    v = &rxv.back();
-  }
-  if (total != v->total) return;
-  memcpy(v->data.data() + seq * VCHUNK, in.body() + 6, n);
-  if (seq == total - 1) v->len = seq * VCHUNK + n;
-  v->got |= 1u << seq;
-  if (v->got != full) {
-    if (last) ackVoice(c, msgId, v->got);  // tells the sender what's missing
-    return;
-  }
-  std::vector<uint8_t> d(v->data.begin(), v->data.begin() + v->len);
-  rxv.erase(rxv.begin() + (v - rxv.data()));
-  ackVoice(c, msgId, full);
-  addLine(c.id, msgId, '<', voiceLabel(d.size(), saveVoice(c.id, 'i', d)));
-  if (contacts[cur].id != c.id) sys(String("voice from ") + c.name + " (Tab)");
-  playVoice(d.data(), d.size());
-}
-
-void onBeacon(Inner &in, Contact *c) {
-  if (in.len() < 32 || in.len() > 48 || nodeId(in.body()) != in.src()) return;
-  String name = clean(in.body() + 32, in.len() - 32);
-  if (c) {  // known: just follow renames
-    if (name != c->name) {
-      strlcpy(c->name, name.c_str(), sizeof c->name);
-      save();
-    }
-    return;
-  }
-  for (auto id : ignored)
-    if (id == in.src()) return;
-  if (find(pending, in.src()) || pending.size() >= 8) return;
-  Contact n{};
-  strlcpy(n.name, name.c_str(), sizeof n.name);
-  memcpy(n.pub, in.body(), 32);
-  n.id = in.src();
-  pairKey(n.key, sec, pub, n.pub);
-  pending.push_back(n);
-  sys("REQUEST " + name + " " + fpStr(n.pub) + "  /ok /no");
-  M5Cardputer.Speaker.tone(2000, 80);
-}
-
-void handleRx() {
-  uint8_t pkt[MAXPKT];
-  size_t len = radio.getPacketLength();
-  int st = radio.readData(pkt, sizeof pkt);
-  radio.startReceive();
-  if (st != RADIOLIB_ERR_NONE) return;
-
-  Inner in;
-  if (!openNet(in, pkt, len, netKey)) return;  // not our network
-  if (seenBefore(get32(pkt + len - 16))) return;
-  uint32_t src = in.src(), dst = in.dst();
-  if (src == me) return;
-  lastRssi = radio.getRSSI();
-  dirty = true;
-
-  if (dst != me && pkt[0] > 0) {  // flood relay, same bytes with ttl-1
-    pkt[0] = std::min(pkt[0], TTL) - 1;
-    queue(pkt, len, 200 + random(3000));  // jitter > airtime so relays rarely collide
-  }
-  if (dst != me && dst != BCAST) return;
-
-  Contact *c = find(contacts, src);
-  if (c) c->seen = millis();
-  if (in.type() == T_BEACON) return onBeacon(in, c);
-  if (!c || dst != me || !openE2E(in, c->key) || in.len() < 4) return;  // only contacts can DM us
-  uint32_t msgId = get32(in.body());
-
-  if (in.type() == T_MSG) {
-    uint8_t a[4];
-    put32(a, msgId);
-    send(T_ACK, src, a, 4, c->key, 100 + random(400));  // always ack, our last ack may have been lost
-    for (auto &l : lines)
-      if (l.peer == src && l.msgId == msgId && l.state == '<') return;  // retry dup
-    addLine(src, msgId, '<', clean(in.body() + 4, in.len() - 4));
-    if (contacts[cur].id != src) sys(String("msg from ") + c->name + " (Tab)");
-    M5Cardputer.Speaker.tone(3000, 60);
-  } else if (in.type() == T_VOICE && in.len() > 6) {
-    onVoice(in, *c, msgId);
-  } else if (in.type() == T_ACK) {
-    uint32_t got = in.len() >= 8 ? get32(in.body() + 4) : ~0u;  // voice acks list the chunks received
-    for (size_t i = 0; i < outbox.size(); i++) {
-      Out &o = outbox[i];
-      if (o.msgId != msgId || o.peer != src) continue;
-      o.need &= ~got;
-      if (o.need) o.at = millis();  // resend the missing chunks now
-      else {
-        outbox.erase(outbox.begin() + i);
-        setState(src, msgId, '+');
-      }
-      break;
-    }
-  }
-}
-
+// ---- commands ----
 void command(String s) {
   int sp = s.indexOf(' ');
   String cmd = sp < 0 ? s : s.substring(0, sp), arg = sp < 0 ? "" : s.substring(sp + 1);
   arg.trim();
   if (cmd == "/name" && arg.length()) {
-    myName = arg.substring(0, 16);
+    myName = arg.substring(0, 31);
     prefs.putString("name", myName);
-    sys("name: " + myName);
-    if (netPass.isEmpty()) sys("type network passphrase + Enter");
-    beacon();
-  } else if (cmd == "/net" && arg.length()) {
-    netPass = arg;
-    prefs.putString("net", netPass);
-    netKeyFrom(netKey, netPass.c_str());
-    pending.clear();
-    sys("network set. others with the same passphrase will show up as requests");
-    beacon();
-  } else if (cmd == "/ok") {
-    if (pending.empty()) return sys("no requests");
-    if (contacts.size() >= MAXCONTACTS) return sys("contact list full");
-    contacts.push_back(pending[0]);
-    pending.erase(pending.begin());
-    save();
-    cur = contacts.size() - 1;
-    sys(String("added ") + contacts[cur].name);
-    beacon();  // so they get our request too
+    sys("name: " + myName + ". People show up as ADVERT lines, accept with /ok");
+    node.advert();
+  } else if (cmd == "/ok" || cmd == "/add") {
+    auto it = pending.end();
+    for (auto p = pending.begin(); p != pending.end(); ++p)
+      if (cmd == "/ok" || String(p->name).startsWith(arg)) it = p;  // /ok = newest
+    if (it == pending.end()) return sys("no matching advert");
+    if (!node.addContact(*it)) return sys("contact list full");
+    cur = idOf(*it);
+    sys(String("added ") + it->name);
+    pending.erase(it);
+    saveContacts();
+    if (millis() - lastAdvert > 300000) node.advert();  // so they can add us back
   } else if (cmd == "/no") {
-    if (pending.empty()) return sys("no requests");
-    ignored.push_back(pending[0].id);
-    pending.erase(pending.begin());
+    if (pending.empty()) return sys("no adverts");
+    ignored.push_back(idOf(pending.back()));
+    pending.pop_back();
     sys("ignored until reboot");
   } else if (cmd == "/del") {
-    if (contacts.empty()) return;
-    sys(String("deleted ") + contacts[cur].name);
-    contacts.erase(contacts.begin() + cur);
-    cur = 0;
-    save();
+    ContactInfo *c = node.byId(cur);
+    if (!c) return;
+    sys(String("deleted ") + c->name);
+    node.removeContact(*c);
+    cur = CHAN;
+    saveContacts();
+  } else if (cmd == "/join" && arg.length()) {
+    String name = arg, psk;
+    int sp2 = arg.indexOf(' ');
+    if (sp2 > 0) name = arg.substring(0, sp2), psk = arg.substring(sp2 + 1);
+    uint8_t secret[32] = {};
+    if (name[0] == '#') mesh::Utils::sha256(secret, 16, (const uint8_t *)name.c_str(), name.length());
+    else if (!mesh::Utils::fromHex(secret, 16, psk.c_str())) return sys("/join #name, or /join name <32 hex key>");
+    ChannelDetails cd;
+    int slot = 1;
+    while (slot < MAX_GROUP_CHANNELS && node.getChannel(slot, cd) && cd.name[0]) slot++;
+    if (slot >= MAX_GROUP_CHANNELS) return sys("no free channel slot");
+    setChannel(slot, name, secret, 16);
+    saveChannels();
+    cur = CHAN | slot;
+    sys("joined " + name);
+  } else if (cmd == "/leave") {
+    if (!isChan(cur) || cur == CHAN) return sys("switch to a joined channel first (Public stays)");
+    ChannelDetails empty;
+    memset(&empty, 0, sizeof empty);
+    node.setChannel(cur & 0xff, empty);
+    saveChannels();
+    cur = CHAN;
   } else if (cmd == "/loc") {
     if (!gps.location.isValid() || gps.location.age() > 10000)
       return sys("no GPS fix, sats " + String(gps.satellites.value()));
     sendText("loc " + String(gps.location.lat(), 6) + "," + String(gps.location.lng(), 6));
-  } else if (cmd == "/b") {
-    beacon();
-    sys("beacon sent");
+  } else if (cmd == "/advert") {
+    node.advert();
+    sys("advert sent");
+  } else if (cmd == "/fp") {
+    sys("me " + hex(node.me().pub_key, 8));
+    if (ContactInfo *c = node.byId(cur)) sys(String(c->name) + " " + hex(c->id.pub_key, 8));
+  } else if (cmd == "/repeat") {
+    repeat = arg == "on";
+    prefs.putBool("repeat", repeat);
+    sys(repeat ? "relaying others' packets (disaster mode)" : "not relaying (leave it to repeaters)");
+  } else if (cmd == "/radio") {
+    float f, bw;
+    int sf, cr;
+    if (sscanf(arg.c_str(), "%f %f %d %d", &f, &bw, &sf, &cr) == 4) {
+      prefs.putString("radio", arg);
+      radio_driver.setParams(f, bw, sf, cr);
+    }
+    sys("radio " + prefs.getString("radio", "869.618 62.5 8 5") + "  (/radio freq bw sf cr)");
   } else if (cmd == "/play") {
     if (arg.isEmpty()) playLatest();
     else playFile(sd ? findVoice(0, arg.toInt()) : String());
   } else if (cmd == "/voices") {
-    if (sd && !contacts.empty()) findVoice(contacts[cur].id, 0, true);
-  } else if (cmd == "/fp") {
-    sys("me " + fpStr(pub));
-    if (!contacts.empty()) sys(String(contacts[cur].name) + " " + fpStr(contacts[cur].pub));
+    if (sd && !isChan(cur)) findVoice(cur, 0, true);
   } else {
-    sys("/name /net /ok /no /del /loc /b(eacon) /fp /play [n] /voices  Tab=next  hold G0=talk, tap=replay");
+    sys("/name /ok /add /no /del /join #x /leave /loc /advert /fp /repeat on|off /radio /play [n] /voices");
+    sys("Tab=next chat  hold G0=talk, tap=replay");
   }
 }
 
@@ -538,30 +669,34 @@ void enter(String s) {
   s.trim();
   if (s.isEmpty()) return;
   if (myName.isEmpty()) s = "/name " + s;  // first-boot setup
-  else if (netPass.isEmpty()) s = "/net " + s;
   if (s[0] == '/') command(s);
   else sendText(s);
 }
 
+// ---- screen ----
 void draw() {
   cv.fillSprite(BLACK);
   cv.fillRect(0, 0, 240, 10, status.length() ? RED : NAVY);
   cv.setTextColor(WHITE);
   cv.setCursor(2, 1);
-  if (contacts.empty()) cv.print("no contacts");
+  if (status.length()) cv.print(status);
   else {
-    auto &c = contacts[cur];
-    cv.printf("%.10s %d/%d", c.name, (int)cur + 1, (int)contacts.size());
-    if (c.seen) {
-      uint32_t s = (millis() - c.seen) / 1000;
-      s < 120 ? cv.printf(" %lus", (unsigned long)s) : cv.printf(" %lum", (unsigned long)s / 60);
+    auto all = convs();
+    int idx = std::find(all.begin(), all.end(), cur) - all.begin();
+    cv.printf("%.12s %d/%d", convName(cur).c_str(), idx + 1, (int)all.size());
+    if (ContactInfo *c = node.byId(cur)) {
+      if (c->out_path_len == OUT_PATH_UNKNOWN) cv.print(" flood");
+      else cv.printf(" %dh", c->out_path_len & 63);
+      if (heard.count(cur)) {
+        uint32_t s = (millis() - heard[cur]) / 1000;
+        if (s < 120) cv.printf(" %lus", (unsigned long)s);
+        else cv.printf(" %lum", (unsigned long)s / 60);
+      }
     }
+    cv.setCursor(150, 1);
+    cv.printf("%s%4d s%lu", pending.empty() ? "   " : "ADV", (int)radio_driver.getLastRSSI(),
+              (unsigned long)gps.satellites.value());
   }
-  cv.setCursor(150, 1);
-  if (status.length()) {
-    cv.setCursor(2, 1);
-    cv.print(status);
-  } else cv.printf("%s%4d s%lu", pending.empty() ? "   " : "REQ", lastRssi, (unsigned long)gps.satellites.value());
 
   // newest rows first, then drawn bottom-up
   struct Row {
@@ -569,11 +704,15 @@ void draw() {
     String s;
   };
   std::vector<Row> rows;
-  uint32_t peer = contacts.empty() ? 0 : contacts[cur].id;
   for (int i = (int)lines.size() - 1; i >= 0 && (int)rows.size() < ROWS; i--) {
     auto &l = lines[i];
-    if (l.peer && l.peer != peer) continue;
-    uint16_t col = !l.peer ? DARKGREY : l.state == '<' ? CYAN : l.state == '+' ? GREEN : l.state == '!' ? RED : WHITE;
+    if (l.peer && l.peer != cur) continue;
+    uint16_t col = !l.peer          ? DARKGREY
+                   : l.state == '<' ? CYAN
+                   : l.state == '+' ? GREEN
+                   : l.state == '!' ? RED
+                   : l.state == 's' ? LIGHTGREY
+                                    : WHITE;
     String pre = !l.peer ? "* " : l.state == '<' ? "< " : "> ";
     std::vector<String> chunks;
     for (size_t p = 0; p == 0 || p < l.text.length(); p += COLS)
@@ -596,26 +735,36 @@ void draw() {
   lastDraw = millis();
 }
 
+void syncClockFromGps() {  // MeshCore timestamps need real time; there's no RTC battery
+  if (!gps.date.isValid() || !gps.time.isValid() || gps.date.year() < 2025) return;
+  uint32_t t =
+      DateTime(gps.date.year(), gps.date.month(), gps.date.day(), gps.time.hour(), gps.time.minute(), gps.time.second())
+          .unixtime();
+  int32_t diff = t - rtc_clock.getCurrentTime();
+  if (abs(diff) > 5) {
+    rtc_clock.setCurrentTime(t);
+    sys("clock set from GPS");
+  }
+}
+
 void setup() {
   setCpuFrequencyMhz(80);  // plenty for chat, ~half the CPU current of 240
+  prefs.begin("cardcore");
   // Hardware TRNG needs an entropy source; the ADC one must be off again before M5 uses the ADC
   bootloader_random_enable();
-  esp_fill_random(bootSeed, sizeof bootSeed);
-  prefs.begin("cardxat");
-  if (prefs.getBytes("sec", sec, 32) != 32) {
-    esp_fill_random(sec, 32);
-    prefs.putBytes("sec", sec, 32);
+  mesh::LocalIdentity id;
+  uint8_t idbuf[128];
+  size_t idlen = prefs.getBytes("id", idbuf, sizeof idbuf);
+  if (idlen) id.readFrom(idbuf, idlen);
+  else {
+    do id = mesh::LocalIdentity(&rng);
+    while (id.pub_key[0] == 0x00 || id.pub_key[0] == 0xff);  // reserved hashes
+    prefs.putBytes("id", idbuf, id.writeTo(idbuf, sizeof idbuf));
   }
   bootloader_random_disable();
   // ponytail: keys sit in plain NVS, physical access = key theft. Enable flash encryption if that matters.
-  crypto_x25519_public_key(pub, sec);
-  me = nodeId(pub);
   myName = prefs.getString("name", "");
-  netPass = prefs.getString("net", "");
-  if (netPass.length()) netKeyFrom(netKey, netPass.c_str());
-  contacts.resize(prefs.getBytesLength("contacts") / sizeof(Contact));
-  prefs.getBytes("contacts", contacts.data(), contacts.size() * sizeof(Contact));
-  for (auto &c : contacts) c.seen = 0;
+  repeat = prefs.getBool("repeat", false);
 
   auto cfg = M5.config();
   M5Cardputer.begin(cfg, true);
@@ -632,55 +781,49 @@ void setup() {
 
   pinMode(P_SD_CS, OUTPUT);  // keep the SD card off the bus while the radio starts
   digitalWrite(P_SD_CS, HIGH);
-  SPI.begin(P_SCK, P_MISO, P_MOSI, P_NSS);
-  int st = radio.begin(FREQ, BW, SF, CR, SYNC, TXPWR, 8, TCXO_V, true);
-  if (st != RADIOLIB_ERR_NONE) sys("radio init failed " + String(st));
-  radio.setCurrentLimit(140);
-  radio.setPacketReceivedAction(onRx);
-  radio.startReceive();
+  if (!radio.std_init(&SPI)) sys("radio init failed");
+  rtc_clock.begin();
+  node.begin(id);
+  float f, bw;
+  int sf, cr;
+  if (sscanf(prefs.getString("radio", "").c_str(), "%f %f %d %d", &f, &bw, &sf, &cr) == 4)
+    radio_driver.setParams(f, bw, sf, cr);
+  loadChannels();
+  loadContacts();
+  node.syncClockFromContacts();
+  cur = CHAN;
 
   Serial1.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
-
   sd = SD.begin(P_SD_CS, SPI, 20000000);
-  if (sd) SD.mkdir("/cardxat");
+  if (sd) SD.mkdir("/cardcore");
   else sys("no SD card: voice messages won't be saved");
   c2 = codec2_create(CODEC2_MODE_1300);
   M5Cardputer.Speaker.setVolume(VOLUME);
 
-  sys("me " + fpStr(pub));
+  sys("me " + hex(node.me().pub_key, 8));
   if (myName.isEmpty()) sys("type your name + Enter");
-  else if (netPass.isEmpty()) sys("type network passphrase + Enter");
-  else sys("/help for commands");
-  nextBeacon = millis() + random(3000);
+  else {
+    sys("/help for commands");
+    node.advert();
+  }
 }
 
 void loop() {
   M5Cardputer.update();
   while (Serial1.available()) gps.encode(Serial1.read());
-
-  if (rxFlag) {
-    rxFlag = false;
-    handleRx();
+  if (millis() - lastClock > 10000) {
+    lastClock = millis();
+    syncClockFromGps();
   }
 
-  if (myName.length() && (int32_t)(millis() - nextBeacon) >= 0) beacon();
-
-  for (size_t i = 0; i < outbox.size();) {
-    Out &o = outbox[i];
-    if ((int32_t)(millis() - o.at) < 0) {
-      i++;
-      continue;
-    }
-    if (o.tries >= TRIES) {
-      setState(o.peer, o.msgId, '!');
-      outbox.erase(outbox.begin() + i);
-      continue;
-    }
-    sendMsg(o);
-    i++;
+  node.loop();
+  pumpOutbox();
+  if (toPlay.size() && !node.outbound()) {  // our reply has left
+    std::vector<uint8_t> v;
+    v.swap(toPlay);
+    playVoice(v.data(), v.size());
   }
-
-  pumpTx();  // one packet per loop
+  if (contactsDirty && millis() - lastSave > 30000) saveContacts();
 
   if (M5Cardputer.BtnA.wasPressed()) talk();
 
@@ -689,9 +832,13 @@ void loop() {
     wake();
     if (wasAsleep) return;  // first key only wakes the screen
     auto &k = M5Cardputer.Keyboard.keysState();
-    if (k.tab && !contacts.empty()) cur = (cur + 1) % contacts.size();
+    if (k.tab) {
+      auto all = convs();
+      auto it = std::find(all.begin(), all.end(), cur);
+      cur = it == all.end() || ++it == all.end() ? all[0] : *it;
+    }
     for (char ch : k.word)
-      if (input.length() < MAXTEXT) input += ch;
+      if (input.length() < MAXINPUT) input += ch;
     if (k.del && input.length()) input.remove(input.length() - 1);
     if (k.enter) {
       enter(input);
