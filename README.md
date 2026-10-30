@@ -46,6 +46,7 @@ Rendered by the firmware's own drawing code (`test/host.cpp`).
 | `a` / `A` | advert (zero hop) / flood advert |
 | `d` | discover nearby repeaters (Heard) |
 | `n` / `c` | new #hashtag channel / channel manager (Chats) |
+| `b` / `g` | Bluetooth on/off / GPS on/off (Home) |
 | `g` / `l` | GPS on/off / use the fix as the node location (GPS) |
 | `-` `=` | map zoom: street, local, Catalonia, Europe, world |
 | `n` / `c` / `l` | map: next located node / centre on me / set my location at the crosshair |

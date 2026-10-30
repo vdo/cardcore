@@ -1000,7 +1000,7 @@ static void drawHelp() {
   static const KH G[] = {{"TAB", S_K_PAGE}, {"1-8", S_K_JUMP}, {";.", S_K_UPDOWN}, {",/", S_K_LEFTRIGHT}, {"ENT", S_K_OPEN},
                          {"`", S_K_BACK}, {"a A", S_K_ADVERT}, {"d", S_K_DISCOVER}, {"n", S_K_NEWHASH}, {"c", S_K_CHANNELS},
                          {"g", S_K_GPS}, {"l", S_K_SETLOC}, {"\\", S_K_BLACKOUT}, {"i", S_K_HELP}, {"Fn;.", S_K_SCROLL},
-                         {"DEL", S_K_DEL}, {"- =", S_K_ZOOM}};
+                         {"DEL", S_K_DEL}, {"- =", S_K_ZOOM}, {"b", S_K_BLE}};
   constexpr int N = sizeof G / sizeof *G;
   for (int i = 0; i < N; i++) {
     int x = 3 + (i / 9) * 120, y = ROW0 + (i % 9) * 11;
@@ -1280,6 +1280,8 @@ static void pageKey(int c) {
         page = P_CHATS;
         if (nrecent) openChat(recent[0].chat);
       }
+      if (c == 'b') app_setting_adjust(app_setting_find(S_BLUETOOTH), 1);
+      if (c == 'g') app_gps_toggle();
       break;
     case P_CHATS:
       if (c == K_UP && s > 0) s--;

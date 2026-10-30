@@ -26,7 +26,7 @@
   X(S_RXLOG, "RX LOG", "REGISTRE RX", "REGISTRO RX") \
   X(S_SETUP, "SETUP", "INICIAL", "INICIAL") \
   /* hints */ \
-  X(S_H_HOME, "ENT last chat  a advert  TAB  i help", "ENT últim xat  a anunci  TAB  i ajuda", "ENT últ. chat  a anuncio  TAB  i ayuda") \
+  X(S_H_HOME, "ENT last chat  a advert  b BT  g GPS", "ENT últim xat  a anunci  b BT  g GPS", "ENT últ. chat  a anuncio  b BT  g GPS") \
   X(S_H_CHATS, "ENT open  ,/ filter  n new#  c channels", "ENT obrir  ,/ filtre  n nou#  c canals", "ENT abrir  ,/ filtro  n #nuevo  c canal") \
   X(S_H_CONTACTS, "ENT details  ,/ filter  ;. move", "ENT detalls  ,/ filtre  ;. moure", "ENT detalles  ,/ filtro  ;. mover") \
   X(S_H_HEARD, "d discover  a/A advert  ENT contact", "d descobrir  a/A anunci  ENT contacte", "d descubrir  a/A anuncio  ENT contacto") \
@@ -164,6 +164,7 @@
   X(S_K_NEWHASH, "new #channel", "nou #canal", "nuevo #canal") \
   X(S_K_CHANNELS, "channels", "canals", "canales") \
   X(S_K_GPS, "GPS on/off", "GPS on/off", "GPS on/off") \
+  X(S_K_BLE, "BT on/off", "BT on/off", "BT on/off") \
   X(S_K_SETLOC, "set location", "fixar ubicació", "fijar ubic.") \
   X(S_K_BLACKOUT, "screen off", "apagar pant.", "apagar pant.") \
   X(S_K_HELP, "help", "ajuda", "ayuda") \
