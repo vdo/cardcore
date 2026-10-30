@@ -230,10 +230,12 @@ static void drawHeader(const Status& st) {
   // right side, right to left: battery, GPS, BLE, unread
   int r = W - 3;
   uint16_t bc = st.battPct >= 0 && st.battPct < 20 ? C_WARN : C_MID;
-  cv.drawRect(r - 14, 3, 12, 7, bc);
-  cv.fillRect(r - 2, 5, 2, 3, bc);
-  if (st.battPct > 0) cv.fillRect(r - 12, 5, st.battPct * 8 / 100 < 1 ? 1 : st.battPct * 8 / 100, 3, bc);
-  if (st.charging) cv.drawLine(r - 9, 3, r - 6, 9, C_HOT);
+  if (!st.charging || millis() / 800 % 2) {  // blinks while charging
+    cv.drawRect(r - 14, 3, 12, 7, bc);
+    cv.fillRect(r - 2, 5, 2, 3, bc);
+    if (st.battPct > 0) cv.fillRect(r - 12, 5, st.battPct * 8 / 100 < 1 ? 1 : st.battPct * 8 / 100, 3, bc);
+    if (st.charging) cv.drawLine(r - 9, 3, r - 6, 9, C_HOT);
+  }
   r -= 19;
   if (st.gpsOn) { txt("G", r, 2, st.gpsFix ? C_HI : C_DIM, 1); r -= 8; }
   if (st.bleOn) { txt("B", r, 2, st.bleConn ? C_HI : C_DIM, 1); r -= 8; }

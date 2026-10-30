@@ -1,4 +1,4 @@
-# CARDCORE
+# 📟 CARDCORE
 
 MeshCore companion firmware for the **M5Stack Cardputer ADV** with the **Cap LoRa-1262**: a standalone mesh messenger with a keyboard UI. Public, #hashtag and private channels, direct messages, rooms, repeater admin, metrics, GPS and a world map. The MeshCore phone app can still connect over Bluetooth or USB at the same time.
 
