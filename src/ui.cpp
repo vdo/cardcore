@@ -1,5 +1,5 @@
 // CARDCORE UI: pages, chat, contacts, metrics, settings on the Cardputer's 240x135 screen.
-// Looks and keys follow FRESNELDRONE: phosphor themes, scanlines, header pill, two-line
+// Look: phosphor themes, scanlines, header pill, two-line
 // footer (status + key hints); ;.,/ are the arrows, ` is back, i is help.
 // test/host.cpp compiles this file against a stub canvas to render the screens.
 #ifndef CARDCORE_HOST
@@ -20,7 +20,7 @@ constexpr int W = 240, H = 135, ROW0 = 15, RH = 11, NROWS = 9;
 static M5Canvas cv(&M5Cardputer.Display);
 #endif
 
-// ── phosphor palette (FRESNELDRONE's) ────────────────────────────────────────
+// ── phosphor palette ─────────────────────────────────────────────────────────
 static constexpr uint16_t rgb(int r, int g, int b) { return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3); }
 constexpr uint16_t C_BG = 0;
 static uint16_t C_SCAN, C_BAR, C_DIM, C_MID, C_HI, C_HOT, C_WARN;

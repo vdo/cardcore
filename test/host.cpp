@@ -89,11 +89,11 @@ static Msg M(uint32_t ago, bool out, uint8_t st, int hops, int snr4, const char*
 }
 int app_load(const ChatId&, Msg* out, int max) {
   Msg all[] = {M(900, 0, 0, 3, 22, "Marta", "Bon dia! Algú m'escolta des del Tibidabo?"),
-               M(840, 0, 0, 2, 14, "Pere 📡", "Sí, et rebo per 2 salts. Senyal força bo."),
-               M(600, 1, MS_ACKED, -1, 0, "cardcore", "Hola des de la Cardputer ADV amb MeshCore!"),
+               M(840, 0, 0, 2, 14, "Pere", "Sí, et rebo per 2 salts. Senyal força bo."),
+               M(600, 1, MS_ACKED, -1, 0, "cardcore", "Hola des de la Cardputer ADV!"),
                M(420, 0, 0, 4, -18, "Anna", "Prova de cobertura a Collserola, quin SNR teniu?"),
                M(300, 1, MS_SENT, -1, 0, "cardcore", "+5.2 dB aquí, 3 salts"),
-               M(120, 0, 0, 1, 30, "Jordi", "Perfecte. Ens veiem dissabte a la trobada 👋"),
+               M(120, 0, 0, 1, 30, "Jordi", "Perfecte. Ens veiem dissabte a la trobada."),
                M(20, 1, MS_PENDING, -1, 0, "cardcore", "Allà serem!")};
   int n = std::min<int>(max, sizeof all / sizeof *all);
   memcpy(out, all, n * sizeof *out);
@@ -376,6 +376,5 @@ int main(int argc, char** argv) {
   key(K_ESC);
   uiPrefs.lang = 1, uiPrefs.theme = 1, applyTheme();
   key('1'), shot("home_ca_amber");
-  key('2'), key('\n'), shot("chat_ca_amber");
   return 0;
 }

@@ -4,7 +4,7 @@ MeshCore companion firmware for the **M5Stack Cardputer ADV** with the **Cap LoR
 
 Preconfigured for **MeshCore Catalunya** ([radio config](https://docs.livemap-meshcorecat.com/configuracio-radio/)): 869.618 MHz, BW 62.5 kHz, SF7, CR6, 22 dBm, 2-byte path hashes, with the Public channel. The other community presets are one keypress away (Settings → TEMPLATE).
 
-UI language: English, Català, Español (Settings → LANGUAGE; Català by default). The look and keys follow [FRESNELDRONE](https://github.com/vdo/fresneldrone).
+UI language: English, Català, Español (Settings → LANGUAGE; Català by default).
 
 ## Screens
 
@@ -68,6 +68,10 @@ Rendered by the firmware's own drawing code (`test/host.cpp`).
 Chat history is stored on the microSD card under `/cardcore/` when one is inserted. Without a card it goes to internal flash, keeping the last ~4–8 KB per chat. Grove-port I2C sensors (BME280, SHT4x, INA219…) are picked up for telemetry.
 
 ## Build / flash
+
+Prebuilt binaries are on the [Releases](https://github.com/vdo/cardcore/releases) page. `cardcore-<version>.bin` is the full image: flash it at `0x0` with [ESPConnect](https://thelastoutpostworkshop.github.io/ESPConnect/). `-update.bin` is the app alone, for `0x10000`, and keeps the display and alert preferences.
+
+To build it yourself:
 
 ```sh
 git clone --recursive <this repo>   # MeshCore is a submodule, pinned at v1.18.0

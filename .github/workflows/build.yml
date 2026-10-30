@@ -1,0 +1,47 @@
+# Builds the firmware and runs the laptop check on every push and PR.
+# A pushed tag also publishes a GitHub release with the binaries.
+name: build
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  pull_request:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0  # git describe stamps the version
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ hashFiles('platformio.ini') }}
+      - run: pip install platformio
+      - run: pio run
+      - name: Laptop check
+        run: g++ -std=c++17 -O1 -Isrc -I.pio/libdeps/cardcore/M5GFX/src/lgfx/Fonts test/host.cpp -lz -o cc_host && ./cc_host "$RUNNER_TEMP"
+      - name: Name the binaries
+        run: |
+          v=$(git describe --tags --always)
+          mkdir dist
+          cp cardcore.bin "dist/cardcore-$v.bin"
+          cp .pio/build/cardcore/firmware.bin "dist/cardcore-$v-update.bin"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cardcore
+          path: dist/*
+      - if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            **cardcore-${{ github.ref_name }}.bin**: full image, flash at `0x0` (ESPConnect or `esptool.py write_flash 0x0`). Use it for a first install. It resets the display and alert preferences.
+            **cardcore-${{ github.ref_name }}-update.bin**: app only, flash at `0x10000`. Keeps every setting. Only for devices already running a release that has the 6.4 MB app partition (0.2.0 or later).
