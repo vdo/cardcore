@@ -646,7 +646,7 @@ void app_status(Status& s) {
   s.battMv = battMv, s.battPct = battPct, s.charging = charging;
   s.bleOn = interface_manager.isBluetoothEnabled();
   s.bleConn = interface_manager.isConnected();
-  s.usbConn = false;
+  s.usbConn = HWCDC::isPlugged();
   LocationProvider* lp = sensors.getLocationProvider();
   s.gpsOn = p->gps_enabled && lp;
   s.gpsFix = s.gpsOn && lp->isValid();
@@ -1172,6 +1172,8 @@ void app_loop() {
     tBatt = ms;
     battMv = board.getBattMilliVolts();
     battPct = M5.Power.getBatteryLevel();
-    charging = M5.Power.isCharging() == m5::Power_Class::is_charging;
+    // The ADV's charger has no status line (M5Unified says "unknown"): a USB host means it charges.
+    // ponytail: a wall charger sends no USB frames, so it won't show; watch the voltage rise if that matters.
+    charging = HWCDC::isPlugged() || M5.Power.isCharging() == m5::Power_Class::is_charging;
   }
 }
