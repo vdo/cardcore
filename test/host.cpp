@@ -266,6 +266,16 @@ static void checks() {
   uint32_t mar = daysFromCivil(2026, 3, 29) * 86400u + 3600, oct = daysFromCivil(2026, 10, 25) * 86400u + 3600;
   assert(lastSunday0100(2026, 3) == mar && lastSunday0100(2026, 10) == oct);
   assert(!euSummer(mar - 1) && euSummer(mar) && euSummer(oct - 1) && !euSummer(oct) && !euSummer(NOW + 86400 * 60));
+  {  // charging guess: plug in at 3.80 V, charge, unplug; then a full battery on power, unplugged
+    ChargeGuess g;
+    auto feed = [&](int mv, int k) { for (int i = 0; i < k; i++) g.add(mv + (i % 3) * 8 - 8); return g.on; };  // +-8 mV noise
+    assert(!feed(3800, 20));
+    assert(feed(3900, 3) && feed(3910, 40));  // jump, then stays on while it climbs slowly
+    assert(!feed(3830, 20));                  // unplugged
+    assert(feed(4200, 20));                   // full on power
+    assert(!feed(4140, 20));                  // unplugged: sags
+    assert(!feed(4100, 40));
+  }
 
   float bear;
   float d = geoDistKm(41.3874, 2.1686, 41.4036, 2.1744, &bear);  // Pl. Catalunya -> Sagrada Familia

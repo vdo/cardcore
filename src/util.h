@@ -202,6 +202,26 @@ static bool euSummer(uint32_t utc) {
   return utc >= lastSunday0100(y, 3) && utc < lastSunday0100(y, 10);
 }
 
+// External power, guessed from battery voltage samples taken every 2 s: the Cardputer ADV wires no
+// charge-status or VBUS pin, and on power its battery pin reads the charger's output. Plugging in
+// lifts the reading at once, unplugging drops it; a full battery on power sits at 4.2 V.
+// Tune the thresholds on hardware if it guesses wrong.
+struct ChargeGuess {
+  static constexpr int N = 16, JUMP = 50, FALL = 30, FULL = 4180;  // samples (~30 s), mV
+  int16_t h[N] = {};
+  int n = 0;
+  bool on = false;
+  bool add(int mv) {
+    h[n++ % N] = mv;
+    if (n < N) return on = mv >= FULL;
+    auto avg = [&](int i) { return (h[i % N] + h[(i + 1) % N] + h[(i + 2) % N]) / 3; };
+    int now = avg(n - 3), d = now - avg(n);  // last three samples against the oldest three
+    if (now >= FULL || d >= JUMP) on = true;
+    else if (d <= -FALL) on = false;
+    return on;
+  }
+};
+
 // Great-circle distance (km) and initial bearing (deg) between two points in degrees.
 #include <math.h>
 static float geoDistKm(double la1, double lo1, double la2, double lo2, float* bearing) {

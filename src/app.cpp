@@ -1168,12 +1168,12 @@ void app_loop() {
     airMinHead = (airMinHead + 1) % 60;
     if (airMinN < 60) airMinN++;
   }
-  if (ms - tBatt >= 5000 || !tBatt) {
+  if ((ms - tBatt >= 2000 || !tBatt) && ms > tx_led_until + 1500) {  // a transmit sags the battery
     tBatt = ms;
+    static ChargeGuess power;
     battMv = board.getBattMilliVolts();
     battPct = M5.Power.getBatteryLevel();
-    // The ADV's charger has no status line (M5Unified says "unknown"): a USB host means it charges.
-    // ponytail: a wall charger sends no USB frames, so it won't show; watch the voltage rise if that matters.
-    charging = HWCDC::isPlugged() || M5.Power.isCharging() == m5::Power_Class::is_charging;
+    // The ADV's charger has no status line (M5Unified says "unknown"): a USB host, or the voltage.
+    charging = power.add(battMv) | HWCDC::isPlugged() || M5.Power.isCharging() == m5::Power_Class::is_charging;
   }
 }
