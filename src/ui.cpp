@@ -219,15 +219,14 @@ static void contextText(char* s, int cap) {
 static void drawHeader(const Status& st) {
   cv.fillRect(0, 0, W, 12, C_BAR);
   cv.drawFastHLine(0, 12, W, C_MID);
-  txt("CARDCORE", 3, 2, C_HI);
-  int x = 3 + 8 * 6 + 4;
+  int x = 3;
   int pg = screen == SC_CHAT ? P_CHATS : screen == SC_CONTACT ? P_CONTACTS : screen == SC_CHANNELS ? P_SETTINGS
          : screen == SC_WIZARD ? P_HOME : page;
   const char* pn = screen == SC_CHAT ? tr(S_CHAT) : screen == SC_CONTACT ? tr(S_NODE) : screen == SC_WIZARD ? tr(S_SETUP)
                  : tr(PAGE_NAME[pg]);
   pill(pn, x, 1, PAGE_COLOR[pg]);
   x += pillW(pn) + 4;
-  // right side, right to left: battery, GPS, BLE, unread
+  // right side, right to left: battery, its %, GPS, BLE, unread
   int r = W - 3;
   uint16_t bc = st.battPct >= 0 && st.battPct < 20 ? C_WARN : C_MID;
   if (!st.charging || millis() / 800 % 2) {  // blinks while charging
@@ -236,7 +235,13 @@ static void drawHeader(const Status& st) {
     if (st.battPct > 0) cv.fillRect(r - 12, 5, st.battPct * 8 / 100 < 1 ? 1 : st.battPct * 8 / 100, 3, bc);
     if (st.charging) cv.drawLine(r - 9, 3, r - 6, 9, C_HOT);
   }
-  r -= 19;
+  r -= 17;
+  if (st.battPct >= 0) {
+    char b[6];
+    snprintf(b, sizeof b, "%d%%", st.battPct);
+    txt(b, r, 2, bc, 1);
+    r -= tlen(b) * 6 + 4;
+  }
   if (st.gpsOn) { txt("G", r, 2, st.gpsFix ? C_HI : C_DIM, 1); r -= 8; }
   if (st.bleOn) { txt("B", r, 2, st.bleConn ? C_HI : C_DIM, 1); r -= 8; }
   if (st.usbConn) { txt("U", r, 2, C_HI, 1); r -= 8; }
