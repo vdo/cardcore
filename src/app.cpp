@@ -141,7 +141,7 @@ static void scanLogs() {
 }
 
 // ── pending DMs: retries until acknowledged ──────────────────────────────────
-struct Pending { bool used; uint32_t ack, deadline, ts; uint8_t key[32]; uint8_t attempt; ChatId chat; char text[160]; };
+struct Pending { bool used, phone; uint32_t ack, deadline, ts; uint8_t key[32]; uint8_t attempt; ChatId chat; char text[160]; };
 static Pending pend[6];
 
 static bool sendDm(Pending& p) {
@@ -267,6 +267,13 @@ int app_text_limit(const ChatId& id) {
   return MAX_TEXT_LEN - 2 - (int)strlen(P()->node_name);
 }
 
+static void logSent(const ChatId& id, const Msg& m) {
+  char line[300];
+  formatMsgLine(m, line, sizeof line);
+  appendLine(id, line);
+  if (Meta* mt = meta(id, true)) mt->last = m.ts;
+}
+
 bool app_send(const ChatId& id, const char* text) {
   Msg m = {};
   m.ts = rtc_clock.getCurrentTimeUnique();
@@ -294,12 +301,73 @@ bool app_send(const ChatId& id, const char* text) {
     p->used = true;
     m.status = MS_PENDING;
   }
-  char line[300];
-  formatMsgLine(m, line, sizeof line);
-  appendLine(id, line);
-  if (Meta* mt = meta(id, true)) mt->last = m.ts;
+  logSent(id, m);
   return true;
 }
+
+// ── what the phone app sends, into our chats too ─────────────────────────────
+// The companion has no hook for it, so its link to the app (BLE, USB) is wrapped: a send command
+// from the app is noted, and logged once the firmware's reply says it went out. A DM's reply carries
+// the ACK code, so its ✓ shows here as well; the app's own retries reuse the timestamp.
+static void phoneSent(const uint8_t* cmd, size_t clen, const uint8_t* resp, size_t rlen) {
+  enum { CMD_SEND_TXT = 2, CMD_SEND_CHANNEL_TXT = 3, RESP_OK = 0, RESP_SENT = 6 };
+  Msg m = {};
+  m.out = 1, m.hops = -1, m.status = MS_SENT;
+  snprintf(m.from, sizeof m.from, "%s", P()->node_name);
+  ChatId id;
+  if (cmd[0] == CMD_SEND_TXT && clen >= 14 && cmd[1] == TXT_TYPE_PLAIN && rlen >= 6 && resp[0] == RESP_SENT) {
+    ContactInfo* c = the_mesh.lookupContactByPubKey(cmd + 7, 6);
+    if (!c) return;
+    id = {(uint8_t)(c->type == ADV_TYPE_ROOM ? CK_ROOM : CK_DIRECT), {0}};
+    memcpy(id.key, c->id.pub_key, 6);
+    memcpy(&m.ts, cmd + 3, 4);
+    uint32_t ack;
+    memcpy(&ack, resp + 2, 4);
+    for (auto& p : pend)
+      if (p.used && p.phone && p.ts == m.ts && p.chat == id) { p.ack = ack, p.deadline = millis() + 60000; return; }  // a retry
+    snprintf(m.text, sizeof m.text, "%.*s", (int)(clen - 13), (const char*)cmd + 13);
+    for (auto& p : pend)
+      if (!p.used) {  // track the ACK; the app does the retrying
+        p = {};
+        p.used = p.phone = true, p.ack = ack, p.ts = m.ts, p.chat = id, p.deadline = millis() + 60000;
+        m.status = MS_PENDING;
+        break;
+      }
+  } else if (cmd[0] == CMD_SEND_CHANNEL_TXT && clen >= 7 && cmd[1] == TXT_TYPE_PLAIN && rlen >= 1 && resp[0] == RESP_OK) {
+    ChannelDetails ch;
+    if (!the_mesh.getChannel(cmd[2], ch) || !ch.name[0]) return;
+    id = {channelKind(cmd[2], ch.name), {0}};
+    memcpy(id.key, ch.channel.secret, 6);
+    memcpy(&m.ts, cmd + 3, 4);
+    snprintf(m.text, sizeof m.text, "%.*s", (int)(clen - 7), (const char*)cmd + 7);
+  } else {
+    return;
+  }
+  logSent(id, m);
+  push(EV_SENT, &id, "");
+}
+
+struct PhoneTap : BaseSerialInterface {
+  BaseSerialInterface* in = nullptr;
+  uint8_t cmd[MAX_FRAME_SIZE + 1];
+  size_t cmdLen = 0;
+  void enable() override { in->enable(); }
+  void disable() override { in->disable(); }
+  bool isEnabled() const override { return in->isEnabled(); }
+  bool isConnected() const override { return in->isConnected(); }
+  void loop() override { in->loop(); }
+  bool isWriteBusy() const override { return in->isWriteBusy(); }
+  size_t checkRecvFrame(uint8_t dest[]) override {
+    size_t n = in->checkRecvFrame(dest);
+    if (n) memcpy(cmd, dest, n), cmdLen = n;
+    return n;
+  }
+  size_t writeFrame(const uint8_t src[], size_t len) override {
+    if (cmdLen) phoneSent(cmd, cmdLen, src, len), cmdLen = 0;  // the first frame after a command is its reply
+    return in->writeFrame(src, len);
+  }
+};
+static PhoneTap phoneTap;
 
 void app_open_chat(const ChatId* id) {
   chatOpen = id != nullptr;
@@ -1043,6 +1111,26 @@ int app_setting_action(int i) {
   return AR_FAIL;
 }
 
+// ── SOS ──────────────────────────────────────────────────────────────────────
+int app_sos(bool send) {
+  Gps g;
+  app_gps(g);
+  double la = g.fix ? g.lat : g.nodeLat, lo = g.fix ? g.lon : g.nodeLon;
+  char t[48];
+  if (la || lo) snprintf(t, sizeof t, "SOS! %.5f,%.5f", la, lo);
+  else snprintf(t, sizeof t, "SOS!");
+  int n = 0;
+  ContactInfo c;
+  for (int i = 0; i < the_mesh.getTotalContactSlots(); i++) {
+    if (!the_mesh.getContactByIdx(i, c) || c.type != ADV_TYPE_CHAT || !c.isFav()) continue;
+    if (!send) { n++; continue; }
+    ChatId id = {CK_DIRECT, {0}};
+    memcpy(id.key, c.id.pub_key, 6);
+    n += app_send(id, t);
+  }
+  return n;
+}
+
 // ── MeshCore callbacks (from UITask) ─────────────────────────────────────────
 void app_on_msg(mesh::Packet* pkt, const ContactInfo& from, uint8_t txt_type, uint32_t, const char* text) {
   ChatId id = {(uint8_t)(from.type == ADV_TYPE_ROOM ? CK_ROOM : CK_DIRECT), {0}};
@@ -1054,6 +1142,7 @@ void app_on_msg(mesh::Packet* pkt, const ContactInfo& from, uint8_t txt_type, ui
   snprintf(m.from, sizeof m.from, "%s", from.name);
   snprintf(m.text, sizeof m.text, "%s", text);
   incoming(id, m, from.name);
+  if (id.kind == CK_DIRECT && isSos(text)) push(EV_SOS, &id, "%s|%s", from.name, text + 4);
 }
 
 void app_on_channel_msg(mesh::Packet* pkt, ChannelDetails& ch, const char* text) {
@@ -1126,6 +1215,8 @@ void app_begin() {
   }
   mountSd();
   scanLogs();
+  phoneTap.in = &interface_manager;
+  the_mesh.startInterface(phoneTap);  // re-enables what's already on
   if (!ui.ble) interface_manager.disableBluetooth();
   for (auto& n : noiseHist) n = radio_driver.getNoiseFloor();
 }
@@ -1135,7 +1226,9 @@ void app_loop() {
   static uint32_t t10 = 0, t60 = 0, tBatt = 0, rxAt10 = 0;
   for (auto& p : pend) {  // DM retries
     if (!p.used || (int32_t)(ms - p.deadline) < 0) continue;
-    if (p.attempt < 2) {
+    if (p.phone) {  // the app's message: it may still be retrying, so no verdict
+      p.used = false;
+    } else if (p.attempt < 2) {
       p.attempt++;
       if (!sendDm(p)) resolvePending(p, false);
     } else {

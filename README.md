@@ -1,6 +1,6 @@
 # 📟 CARDCORE
 
-MeshCore companion firmware for the **M5Stack Cardputer ADV** with the **Cap LoRa-1262**: a standalone mesh messenger with a keyboard UI. Public, #hashtag and private channels, direct messages, rooms, repeater admin, metrics, GPS and a world map. The MeshCore phone app can still connect over Bluetooth or USB at the same time.
+MeshCore companion firmware for the **M5Stack Cardputer ADV** with the **Cap LoRa-1262**: a standalone mesh messenger with a keyboard UI. Public, #hashtag and private channels, direct messages, SOS alerts, rooms, repeater admin, metrics, GPS and a world map. The MeshCore phone app can still connect over Bluetooth or USB at the same time.
 
 Preconfigured for **MeshCore Catalunya** ([radio config](https://docs.livemap-meshcorecat.com/configuracio-radio/)): 869.618 MHz, BW 62.5 kHz, SF7, CR6, 22 dBm, 2-byte path hashes, with the Public channel. The other community presets are one keypress away (Settings → TEMPLATE).
 
@@ -32,8 +32,10 @@ Rendered by the firmware's own drawing code (`test/host.cpp`).
 | **Setup wizard** on first boot (and after a factory reset): language, name, template, location, Bluetooth, then a flood advert. `` ` `` skips a step | Template step: Catalunya preselected |
 | <img src="docs/channels.png" width="360"> | <img src="docs/new_hashtag.png" width="360"> |
 | **Channels** (`c` on Chats): `n` hashtag, `p` private (32 hex key), Del removes, Enter shows the key | Adding `#barcelona`: its key is `sha256("#barcelona")`, as in the MeshCore app |
-| <img src="docs/home_ca_amber.png" width="360"> | <img src="docs/help.png" width="360"> |
-| Català, AMBER theme (5 themes) | **Help** (`i`) |
+| <img src="docs/sos.png" width="360"> | <img src="docs/help.png" width="360"> |
+| **SOS** received: siren and red LED until answered, with distance and bearing. `S` sends one | **Help** (`i`) |
+| <img src="docs/home_ca_amber.png" width="360"> | |
+| Català, AMBER theme (5 themes) | |
 
 ## Keys
 
@@ -47,12 +49,18 @@ Rendered by the firmware's own drawing code (`test/host.cpp`).
 | `d` | discover nearby repeaters (Heard) |
 | `n` / `c` | new #hashtag channel / channel manager (Chats) |
 | `b` / `g` | Bluetooth on/off / GPS on/off (Home) |
+| `S` | SOS to your favourite contacts (asks twice; the second time only `Y` sends) |
+| `M` | mute / unmute the alert beeps (Home) |
 | `g` / `l` | GPS on/off / use the fix as the node location (GPS) |
 | `-` `=` | map zoom: street, local, Catalonia, Europe, world |
 | `n` / `c` / `l` | map: next located node / centre on me / set my location at the crosshair |
 | `Del` | backspace; remove a channel (Channels) |
 | `\` | screen off (any key wakes it) |
 | `i` | help |
+
+## SOS
+
+**SOS** (`S`, Enter, then `Y` at the second prompt, which shows how many contacts it will reach) sends `SOS! <lat>,<lon>` to every favourite chat contact, with the GPS fix or the node's set location. It's a normal DM, so any MeshCore app can read it. A Cardputer receiving it sounds a siren, even with alert sounds off, and blinks the LED until you open the chat (Enter) or dismiss it (`` ` ``). Mark the people who should get it as favourites (Contacts → FAVOURITE).
 
 ## Settings
 
@@ -106,6 +114,6 @@ On macOS with a newer SDK than its linker understands, add `-isysroot /Library/D
 ## Known limits
 
 - Rooms: there is no keep-alive after login, because MeshCore keeps `startConnection` protected. Log in again if a room goes quiet.
-- Messages you send from the Cardputer don't appear in the phone app, and vice versa. Incoming messages reach both.
+- Messages sent from the phone app (Bluetooth or USB) show up in the Cardputer's chats, with the DM's ✓ when it's acknowledged. Messages typed on the Cardputer don't appear in the phone app. Incoming messages reach both.
 - Text entry is ASCII (the keyboard has no accent keys). Received accents display where the 6×8 font has them; emoji show as `?`.
 - Not yet tested on hardware: built and rendered, not run. First-boot report welcome.

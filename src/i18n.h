@@ -26,7 +26,7 @@
   X(S_RXLOG, "RX LOG", "REGISTRE RX", "REGISTRO RX") \
   X(S_SETUP, "SETUP", "INICIAL", "INICIAL") \
   /* hints */ \
-  X(S_H_HOME, "ENT last chat  a advert  b BT  g GPS", "ENT últim xat  a anunci  b BT  g GPS", "ENT últ. chat  a anuncio  b BT  g GPS") \
+  X(S_H_HOME, "ENT chat  a advert  b BT  g GPS  M mute", "ENT xat  a anunci  b BT  g GPS  M so", "ENT chat  a anuncio  b BT  g GPS  M son") \
   X(S_H_CHATS, "ENT open  ,/ filter  n new#  c channels", "ENT obrir  ,/ filtre  n nou#  c canals", "ENT abrir  ,/ filtro  n #nuevo  c canal") \
   X(S_H_CONTACTS, "ENT details  ,/ filter  ;. move", "ENT detalls  ,/ filtre  ;. moure", "ENT detalles  ,/ filtro  ;. mover") \
   X(S_H_HEARD, "d discover  a/A advert  ENT contact", "d descobrir  a/A anunci  ENT contacte", "d descubrir  a/A anuncio  ENT contacto") \
@@ -171,6 +171,18 @@
   X(S_K_SCROLL, "scroll chat", "desplaçar xat", "desplazar chat") \
   X(S_K_DEL, "erase/remove", "esborrar", "borrar") \
   X(S_K_ZOOM, "map zoom", "zoom del mapa", "zoom del mapa") \
+  X(S_K_ARROWS, "move/adjust", "moure/ajust", "mover/ajuste") \
+  X(S_K_SOS, "SOS alert", "alerta SOS", "alerta SOS") \
+  /* SOS */ \
+  X(S_SOS_ASK, "Send SOS to favourites?", "Enviar SOS als preferits?", "¿Enviar SOS a favoritos?") \
+  X(S_SOS_SENT, "SOS sent to", "SOS enviat a", "SOS enviado a") \
+  X(S_SOS_SURE, "Y sends SOS to", "Y envia SOS a", "Y envía SOS a") \
+  X(S_H_SOS_SURE, "Y send SOS   any other key cancels", "Y envia SOS   altra tecla cancel·la", "Y envía SOS   otra tecla cancela") \
+  X(S_SOUND_ON, "beeps on", "sons activats", "sonidos activados") \
+  X(S_SOUND_OFF, "beeps muted (SOS still sounds)", "sons silenciats (l'SOS sona igual)", "sonidos silenciados (SOS suena igual)") \
+  X(S_NO_FAVS, "no favourites (Contacts: FAVOURITE)", "cap preferit (Contactes: PREFERIT)", "sin favoritos (Contactos: FAVORITO)") \
+  X(S_SOS_NOPOS, "no position given", "sense posició", "sin posición") \
+  X(S_SOS_HINT, "ENT open chat  ` dismiss", "ENT obrir xat  ` tancar", "ENT abrir chat  ` cerrar") \
   /* inputs & toasts */ \
   X(S_IN_HASHTAG, "Hashtag channel name", "Nom del canal hashtag", "Nombre del canal hashtag") \
   X(S_IN_CHNAME, "Private channel name", "Nom del canal privat", "Nombre del canal privado") \

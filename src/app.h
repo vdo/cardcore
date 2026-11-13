@@ -146,8 +146,11 @@ void app_ui_save();
 int app_setting_find(uint16_t label);  // row index by its label, -1 if none
 void app_apply_preset(int i);
 
+// ── SOS ──────────────────────────────────────────────────────────────────────
+int app_sos(bool send);                 // "SOS! lat,lon" to every favourite companion; how many (false: just count)
+
 // ── events for the UI: toasts, beeps, the LED ────────────────────────────────
-enum EventKind { EV_MSG, EV_ACK, EV_FAIL, EV_REPLY, EV_CONTACT, EV_TOAST };
+enum EventKind { EV_MSG, EV_ACK, EV_FAIL, EV_REPLY, EV_CONTACT, EV_TOAST, EV_SOS, EV_SENT };  // EV_SOS text: "name|lat,lon"
 struct Event {
   uint8_t kind;
   ChatId chat;

@@ -87,7 +87,7 @@ static Msg M(uint32_t ago, bool out, uint8_t st, int hops, int snr4, const char*
   snprintf(m.text, sizeof m.text, "%s", text);
   return m;
 }
-int app_load(const ChatId&, Msg* out, int max) {
+int app_load(const ChatId& id, Msg* out, int max) {
   Msg all[] = {M(900, 0, 0, 3, 22, "Marta", "Bon dia! Algú m'escolta des del Tibidabo?"),
                M(840, 0, 0, 2, 14, "Pere", "Sí, et rebo per 2 salts. Senyal força bo."),
                M(600, 1, MS_ACKED, -1, 0, "cardcore", "Hola des de la Cardputer ADV!"),
@@ -207,6 +207,7 @@ int app_setting_action(int) { return AR_DONE; }
 static Event evq[2];
 static int nev = 0;
 bool app_event(Event& e) { if (!nev) return false; e = evq[--nev]; return true; }
+int app_sos(bool) { return 2; }
 void app_begin() {}
 void app_loop() {}
 
@@ -277,6 +278,8 @@ static void checks() {
     assert(!feed(4100, 40));
   }
 
+  assert(isSos("SOS! 41.41387,2.16082") && !isSos("SOS"));
+
   float bear;
   float d = geoDistKm(41.3874, 2.1686, 41.4036, 2.1744, &bear);  // Pl. Catalunya -> Sagrada Familia
   assert(d > 1.7f && d < 2.0f && bear > 10 && bear < 30 && !strcmp(compass(bear), "N"));
@@ -291,13 +294,14 @@ static void checks() {
     uiPrefs.lang = lang;
     for (int id = S_TEMPLATE; id <= S_FACTORY; id++) assert(cols(tr(id)) <= 16 || !fprintf(stderr, "label: %s\n", tr(id)));
     for (int id = S_H_HOME; id <= S_H_CONFIRM; id++) assert(cols(tr(id)) <= (id == S_H_CHAT ? 31 : 39) || !fprintf(stderr, "hint: %s\n", tr(id)));
-    for (int id = S_K_PAGE; id <= S_K_ZOOM; id++) assert(cols(tr(id)) <= 14 || !fprintf(stderr, "help: %s\n", tr(id)));
+    for (int id = S_K_PAGE; id <= S_K_SOS; id++) assert(cols(tr(id)) <= 14 || !fprintf(stderr, "help: %s\n", tr(id)));
     for (int id = S_HOME; id <= S_MAP; id++) assert(cols(tr(id)) <= 9 || !fprintf(stderr, "page: %s\n", tr(id)));
     for (int id = S_A_MESSAGE; id <= S_A_DELETE; id++) assert(cols(tr(id)) <= 17 || !fprintf(stderr, "action: %s\n", tr(id)));
     for (int id : {S_W_LOC_GPS, S_W_LOC_TYPE, S_W_SKIP}) assert(cols(tr(id)) <= 23 || !fprintf(stderr, "wizard: %s\n", tr(id)));
     for (int id : {S_W_BLE_ON, S_W_BLE_OFF, S_W_NAME, S_W_LOC_INPUT}) assert(cols(tr(id)) <= 35 || !fprintf(stderr, "wizard: %s\n", tr(id)));
     for (int id : {S_W_WAIT_FIX, S_W_ADVERT, S_W_WELCOME}) assert(cols(tr(id)) <= 39 || !fprintf(stderr, "wizard: %s\n", tr(id)));
     assert(cols(tr(S_SETUP)) <= 9);
+    for (int id = S_SOS_ASK; id <= S_SOS_HINT; id++) assert(cols(tr(id)) <= 39 || !fprintf(stderr, "toast: %s\n", tr(id)));
   }
   uiPrefs.lang = 0;
   puts("checks ok");
@@ -355,6 +359,9 @@ int main(int argc, char** argv) {
   key(K_DOWN), key(K_DOWN), key('\n');
   for (const char* p = "Fins dissabte!"; *p; p++) key(*p);
   shot("chat");
+  key(K_ESC), ui_host_open_chat(cid(CK_DIRECT, 5));
+  nowMs += 500, ui_host_sos(cid(CK_DIRECT, 5), "Jordi T-Deck", "41.40360,2.17440"), shot("sos");
+  nowMs -= 500, key(K_ESC);
   key(K_ESC), key('3'), shot("contacts");
   key(K_DOWN), key('\n'), shot("contact");
   key(K_DOWN), key(K_DOWN), overlay = OV_REPLY, shot("status");

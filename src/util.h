@@ -238,3 +238,6 @@ static const char* compass(float deg) {
   static const char* const P[] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
   return P[(int)((deg + 22.5f) / 45) % 8];
 }
+
+// "SOS! 41.41387,2.16082": the alert DM, readable by any MeshCore app; CardCore sounds an alarm.
+static bool isSos(const char* t) { return !strncmp(t, "SOS!", 4); }

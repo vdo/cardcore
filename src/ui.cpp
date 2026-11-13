@@ -51,9 +51,9 @@ static void applyTheme() {
 enum Page { P_HOME, P_CHATS, P_CONTACTS, P_HEARD, P_METRICS, P_GPS, P_MAP, P_SETTINGS, NPAGE };
 static const uint16_t PAGE_NAME[NPAGE] = {S_HOME, S_CHATS, S_CONTACTS, S_HEARD, S_METRICS, S_GPS, S_MAP, S_SETTINGS};
 enum Screen { SC_PAGE, SC_CHAT, SC_CONTACT, SC_CHANNELS, SC_WIZARD };
-enum Overlay { OV_NONE, OV_HELP, OV_INPUT, OV_CONFIRM, OV_REPLY };
+enum Overlay { OV_NONE, OV_HELP, OV_INPUT, OV_CONFIRM, OV_REPLY, OV_SOS };
 enum Input { IN_SETTING, IN_LOGIN, IN_HASHTAG, IN_PRIV_NAME, IN_PRIV_KEY, IN_WIZ_NAME, IN_WIZ_LOC };
-enum Confirm { CO_SETTING, CO_DEL_CONTACT, CO_DEL_CHANNEL };
+enum Confirm { CO_SETTING, CO_DEL_CONTACT, CO_DEL_CHANNEL, CO_SOS, CO_SOS_SURE };
 enum Key { K_UP = 0x80, K_DOWN, K_LEFT, K_RIGHT, K_ESC = 0x1B };
 enum WizStep { W_LANG, W_NAME, W_PRESET, W_LOC, W_BLE, W_DONE, NWIZ };
 static int wizStep = 0, wizSel = 0, wizTop = 0;
@@ -95,6 +95,7 @@ static uint32_t toastUntil = 0;
 static bool toastWarn = false;
 static uint32_t lastKeyAt = 0, ledUntil = 0, discoverUntil = 0;
 static bool dark = false, dirty = true;
+static struct { ChatId chat; char from[24], pos[40]; uint32_t at; } sos;  // the last SOS received
 
 struct Recent { ChatId chat; char line[64]; uint32_t at; };
 static Recent recent[4];
@@ -126,6 +127,13 @@ static void hwBeep(bool msg) {
   } else {
     M5Cardputer.Speaker.tone(1760, 40);
   }
+#endif
+}
+static void hwAlarm(int phase) {  // SOS: loud even with alert sounds off
+#ifndef CARDCORE_HOST
+  M5Cardputer.Speaker.begin();
+  M5Cardputer.Speaker.setVolume(255);
+  M5Cardputer.Speaker.tone(phase ? 1900 : 1400, 450);
 #endif
 }
 static void hwLed(uint8_t r, uint8_t g, uint8_t b) {
@@ -264,7 +272,8 @@ static void drawHeader(const Status& st) {
 static const char* hintFor() {
   if (overlay == OV_HELP) return tr(S_H_ANYKEY);
   if (overlay == OV_INPUT) return tr(S_H_INPUT);
-  if (overlay == OV_CONFIRM) return tr(S_H_CONFIRM);
+  if (overlay == OV_CONFIRM) return tr(confirmKind == CO_SOS_SURE ? S_H_SOS_SURE : S_H_CONFIRM);
+  if (overlay == OV_SOS) return tr(S_SOS_HINT);
   if (overlay == OV_REPLY) return tr(S_H_ANYKEY);
   switch (screen) {
     case SC_CHAT: return tr(S_H_CHAT);
@@ -1002,10 +1011,10 @@ static void drawChannels() {
 // ── overlays ─────────────────────────────────────────────────────────────────
 static void drawHelp() {
   struct KH { const char* k; uint16_t d; };
-  static const KH G[] = {{"TAB", S_K_PAGE}, {"1-8", S_K_JUMP}, {";.", S_K_UPDOWN}, {",/", S_K_LEFTRIGHT}, {"ENT", S_K_OPEN},
-                         {"`", S_K_BACK}, {"a A", S_K_ADVERT}, {"d", S_K_DISCOVER}, {"n", S_K_NEWHASH}, {"c", S_K_CHANNELS},
-                         {"g", S_K_GPS}, {"l", S_K_SETLOC}, {"\\", S_K_BLACKOUT}, {"i", S_K_HELP}, {"Fn;.", S_K_SCROLL},
-                         {"DEL", S_K_DEL}, {"- =", S_K_ZOOM}, {"b", S_K_BLE}};
+  static const KH G[] = {{"TAB", S_K_PAGE}, {"1-8", S_K_JUMP}, {";.,/", S_K_ARROWS}, {"ENT", S_K_OPEN}, {"`", S_K_BACK},
+                         {"a A", S_K_ADVERT}, {"d", S_K_DISCOVER}, {"n", S_K_NEWHASH}, {"c", S_K_CHANNELS},
+                         {"g", S_K_GPS}, {"b", S_K_BLE}, {"l", S_K_SETLOC}, {"\\", S_K_BLACKOUT}, {"Fn;.", S_K_SCROLL},
+                         {"DEL", S_K_DEL}, {"- =", S_K_ZOOM}, {"S", S_K_SOS}};
   constexpr int N = sizeof G / sizeof *G;
   for (int i = 0; i < N; i++) {
     int x = 3 + (i / 9) * 120, y = ROW0 + (i % 9) * 11;
@@ -1047,6 +1056,30 @@ static void drawReply() {
   }
   if (!r.ok) txt(tr(S_FAILED), 230, 17, C_WARN, 1);
   for (int i = 0; i < r.n; i++) txtFit(r.lines[i], 9, 29 + i * 9, r.ok ? C_MID : C_WARN, 37);
+}
+
+static void drawSos() {  // flashes until answered
+  bool on = millis() / 500 % 2;
+  uint16_t fg = on ? C_BG : C_WARN;
+  cv.fillRect(6, 15, W - 12, 96, on ? C_WARN : C_BG);
+  cv.drawRect(6, 15, W - 12, 96, C_WARN);
+  cv.setTextSize(3);
+  txt("SOS", W / 2, 20, fg, 2);
+  cv.setTextSize(1);
+  txt(sos.from, W / 2, 48, fg, 2);
+  txt(*sos.pos ? sos.pos : tr(S_SOS_NOPOS), W / 2, 61, fg, 2);
+  char b[40];
+  const char* comma = strchr(sos.pos, ',');
+  Gps g;
+  app_gps(g);
+  double la = g.fix ? g.lat : g.nodeLat, lo = g.fix ? g.lon : g.nodeLon;
+  if (comma && (la || lo)) {
+    float brg, km = geoDistKm(la, lo, atof(sos.pos), atof(comma + 1), &brg);
+    snprintf(b, sizeof b, km < 10 ? "%.2f km %s" : "%.0f km %s", km, compass(brg));
+    txt(b, W / 2, 74, fg, 2);
+  }
+  fmtAge((millis() - sos.at) / 1000, b, sizeof b);
+  txt(b, W / 2, 92, fg, 2);
 }
 
 // ── first-boot setup wizard ──────────────────────────────────────────────────
@@ -1138,6 +1171,7 @@ static void draw() {
   else if (overlay == OV_INPUT) drawInput();
   else if (overlay == OV_CONFIRM) drawConfirm();
   else if (overlay == OV_REPLY) drawReply();
+  else if (overlay == OV_SOS) drawSos();
   drawFooter(st, mt);
   cv.pushSprite(0, 0);
 }
@@ -1252,6 +1286,21 @@ static void confirmDone(bool yes) {
     case CO_DEL_CHANNEL:
       say(app_remove_channel(confirmCtx) ? tr(S_DELETED) : tr(S_FAILED));
       break;
+    case CO_SOS: {  // second step: who gets it, and only Y sends
+      int n = app_sos(false);
+      if (!n) return say(tr(S_NO_FAVS), true);
+      char b[48];
+      snprintf(b, sizeof b, "%s %d", tr(S_SOS_SURE), n);
+      startConfirm(CO_SOS_SURE, n, b);
+      break;
+    }
+    case CO_SOS_SURE: {
+      int n = app_sos(true);
+      char b[48];
+      snprintf(b, sizeof b, "%s %d", tr(S_SOS_SENT), n);
+      say(n ? b : tr(S_NO_FAVS), true);
+      break;
+    }
   }
 }
 
@@ -1287,6 +1336,10 @@ static void pageKey(int c) {
       }
       if (c == 'b') app_setting_adjust(app_setting_find(S_BLUETOOTH), 1);
       if (c == 'g') app_gps_toggle();
+      if (c == 'M' || c == 'm') {  // mute / unmute the alert beeps
+        app_setting_adjust(app_setting_find(S_SOUND), 1);
+        say(tr(app_ui().sound ? S_SOUND_ON : S_SOUND_OFF));
+      }
       break;
     case P_CHATS:
       if (c == K_UP && s > 0) s--;
@@ -1391,7 +1444,12 @@ static void pageKey(int c) {
 static void onKey(int c) {
   dirty = true;
   if (overlay == OV_HELP || overlay == OV_REPLY) { overlay = OV_NONE; return; }
-  if (overlay == OV_CONFIRM) { confirmDone(c == 'y' || c == 'Y' || c == '\n'); return; }
+  if (overlay == OV_CONFIRM) { confirmDone(c == 'y' || c == 'Y' || (c == '\n' && confirmKind != CO_SOS_SURE)); return; }
+  if (overlay == OV_SOS) {
+    if (c == '\n') overlay = OV_NONE, openChat(sos.chat);
+    if (c == K_ESC) overlay = OV_NONE;
+    return;
+  }
   if (overlay == OV_INPUT) {
     if (c == K_ESC) {
       overlay = OV_NONE;
@@ -1426,6 +1484,7 @@ static void onKey(int c) {
   if (c == '\\') { dark = true; hwBright(-1); return; }
   if (c == '\t') { screen = SC_PAGE; page = (page + 1) % NPAGE; return; }
   if (c >= '1' && c <= '8') { screen = SC_PAGE; page = c - '1'; return; }
+  if (c == 'S') { startConfirm(CO_SOS, 0, tr(S_SOS_ASK)); return; }
   if (c == 'a' || c == 'A') { app_advert(c == 'A'); say(tr(c == 'A' ? S_ADVERT_FLOOD : S_ADVERT_SENT)); return; }
   if (screen == SC_CONTACT) {
     if (c == K_ESC) screen = SC_PAGE;
@@ -1530,6 +1589,7 @@ static void serviceEvents() {
       }
       case EV_ACK:
       case EV_FAIL:
+      case EV_SENT:  // the phone app sent something
         if (screen == SC_CHAT && e.chat == chatId) reloadChat();
         if (e.kind == EV_FAIL) say(e.text, true);
         break;
@@ -1541,6 +1601,18 @@ static void serviceEvents() {
       case EV_TOAST:
         say(e.text);
         break;
+      case EV_SOS: {
+        const char* bar = strchr(e.text, '|');
+        int n = bar ? bar - e.text : 0;
+        snprintf(sos.from, sizeof sos.from, "%.*s", n < 23 ? n : 23, e.text);
+        const char* pos = bar ? bar + 1 : "";
+        while (*pos == ' ') pos++;
+        snprintf(sos.pos, sizeof sos.pos, "%s", pos);
+        sos.chat = e.chat, sos.at = millis();
+        overlay = OV_SOS;
+        if (dark) { dark = false; hwBright(app_ui().bright); }
+        break;
+      }
     }
   }
 }
@@ -1616,6 +1688,15 @@ void ui_loop() {
 #ifndef CARDCORE_HOST
   if (app_ui().led && tx_led_until > now && !ledUntil) { hwLed(30, 0, 0); ledUntil = tx_led_until; }
 #endif
+  if (overlay == OV_SOS) {  // alarm until answered: tone and red LED, screen kept on
+    static int phase = -1;
+    lastKeyAt = now;
+    if ((int)(now / 500 % 2) != phase) {
+      phase = now / 500 % 2;
+      hwAlarm(phase);  // two-tone siren
+      hwLed(phase ? 0 : 90, 0, 0), ledUntil = now + 600;
+    }
+  }
   uint16_t to = TIMEOUT_S[app_ui().timeout % 5];
   if (!dark && to && now - lastKeyAt > to * 1000UL) { dark = true; hwBright(-1); }
   if (dark) return;
@@ -1630,6 +1711,12 @@ void ui_loop() {
 void ui_host_key(int c) { onKey(c); }
 void ui_host_draw() { draw(); }
 void ui_host_open_chat(const ChatId& id) { openChat(id); }
+void ui_host_sos(const ChatId& id, const char* from, const char* pos) {
+  sos.chat = id, sos.at = millis() - 40000;
+  snprintf(sos.from, sizeof sos.from, "%s", from);
+  snprintf(sos.pos, sizeof sos.pos, "%s", pos);
+  overlay = OV_SOS;
+}
 void ui_host_wizard(int step, int sel) { screen = SC_WIZARD, overlay = OV_NONE, wizGo(step), wizSel = sel; }
 void ui_host_recent(const ChatId& id, const char* line, uint32_t at) {
   recent[nrecent].chat = id;
